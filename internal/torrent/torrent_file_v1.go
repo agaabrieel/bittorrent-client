@@ -18,7 +18,6 @@ type Torrent struct {
 }
 
 type TorrentInfoDict struct {
-	Raw         []byte
 	Length      uint64
 	Name        string
 	Files       []TorrentFilesDict
@@ -47,12 +46,12 @@ func (t *Torrent) Deserialize(filepath string) error {
 		return err
 	}
 
-	bencodeValue, err := parser.ParseBencode(ctx)
+	rootBencodeDict, err := ctx.Parse()
 	if err != nil {
 		return err
 	}
 
-	dict, err := bencodeValue.GetDictValue()
+	dict, err := rootBencodeDict.GetDictValue()
 	if err != nil {
 		return fmt.Errorf("invalid torrent structure: %w", err)
 	}
@@ -108,7 +107,7 @@ func (t *Torrent) Deserialize(filepath string) error {
 
 		case "info":
 
-			rawInfo, err := entry.Value.Marshal()
+			rawInfo, err := entry.Value.Serialize()
 			if err != nil {
 				return fmt.Errorf("error parsing infohash: %w", err)
 			}
@@ -298,6 +297,5 @@ func (t *Torrent) Deserialize(filepath string) error {
 
 func (t *Torrent) SetInfoHash(raw []byte) {
 	hash := sha1.New()
-	fmt.Printf("%s\n", raw)
 	t.Infohash = [20]byte(hash.Sum(raw))
 }

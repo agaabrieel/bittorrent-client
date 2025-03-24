@@ -24,7 +24,7 @@ func NewParserContext(path string) (*ParserContext, error) {
 
 }
 
-func ParseBencode(ctx *ParserContext) (*BencodeValue, error) {
+func (ctx *ParserContext) Parse() (*BencodeValue, error) {
 
 	var val *BencodeValue
 	var err error
@@ -37,14 +37,14 @@ func ParseBencode(ctx *ParserContext) (*BencodeValue, error) {
 
 	switch char {
 	case 'd':
-		val, err = ParseDict(ctx)
+		val, err = parseDict(ctx)
 	case 'l':
-		val, err = ParseList(ctx)
+		val, err = parseList(ctx)
 	case 'i':
-		val, err = ParseInteger(ctx)
+		val, err = parseInteger(ctx)
 	default:
 		if unicode.IsDigit(rune(char)) {
-			val, err = ParseString(ctx)
+			val, err = parseString(ctx)
 		} else {
 			return nil, errors.New("PARSER::ERROR::UNKNOWN_CHAR")
 		}
@@ -54,7 +54,7 @@ func ParseBencode(ctx *ParserContext) (*BencodeValue, error) {
 
 }
 
-func ParseInteger(ctx *ParserContext) (*BencodeValue, error) {
+func parseInteger(ctx *ParserContext) (*BencodeValue, error) {
 
 	ctx.pos++ // Get to the next token
 
@@ -84,7 +84,7 @@ func ParseInteger(ctx *ParserContext) (*BencodeValue, error) {
 
 }
 
-func ParseString(ctx *ParserContext) (*BencodeValue, error) {
+func parseString(ctx *ParserContext) (*BencodeValue, error) {
 
 	start := ctx.pos
 
@@ -114,7 +114,7 @@ func ParseString(ctx *ParserContext) (*BencodeValue, error) {
 	return &val, nil
 }
 
-func ParseList(ctx *ParserContext) (*BencodeValue, error) {
+func parseList(ctx *ParserContext) (*BencodeValue, error) {
 
 	ctx.pos++
 
@@ -127,7 +127,7 @@ func ParseList(ctx *ParserContext) (*BencodeValue, error) {
 				return nil, errors.New("ERROR::PARSER::NO_MATCHING_END_TAG")
 			}
 
-			value, err := ParseBencode(ctx)
+			value, err := ctx.Parse()
 			if err != nil {
 				return nil, err
 			}
@@ -149,7 +149,7 @@ func ParseList(ctx *ParserContext) (*BencodeValue, error) {
 	return &val, nil
 }
 
-func ParseDict(ctx *ParserContext) (*BencodeValue, error) {
+func parseDict(ctx *ParserContext) (*BencodeValue, error) {
 
 	ctx.pos++
 
@@ -162,12 +162,12 @@ func ParseDict(ctx *ParserContext) (*BencodeValue, error) {
 				return nil, errors.New("ERROR::PARSER::NO_MATCHING_END_TAG")
 			}
 
-			key, err := ParseBencode(ctx)
+			key, err := ctx.Parse()
 			if err != nil {
 				return nil, err
 			}
 
-			value, err := ParseBencode(ctx)
+			value, err := ctx.Parse()
 			if err != nil {
 				return nil, err
 			}
