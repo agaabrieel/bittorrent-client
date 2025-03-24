@@ -1,8 +1,9 @@
 package main
 
 import (
-	parser "bencode_parser/internal"
 	"fmt"
+
+	parser "github.com/agaabrieel/bittorrent-client/internal"
 )
 
 func main() {
