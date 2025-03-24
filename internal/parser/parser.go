@@ -7,14 +7,14 @@ import (
 	"unicode"
 )
 
-func NewParserContext(path string) (*Parser_Context, error) {
+func NewParserContext(path string) (*ParserContext, error) {
 
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx := Parser_Context{
+	ctx := ParserContext{
 		input: data,
 		pos:   0,
 		size:  uint64(len(data)),
@@ -24,9 +24,9 @@ func NewParserContext(path string) (*Parser_Context, error) {
 
 }
 
-func ParseBencode(ctx *Parser_Context) (*Bencode_Value, error) {
+func (ctx *ParserContext) Parse() (*BencodeValue, error) {
 
-	var val *Bencode_Value
+	var val *BencodeValue
 	var err error
 
 	if ctx.pos >= ctx.size {
@@ -37,14 +37,14 @@ func ParseBencode(ctx *Parser_Context) (*Bencode_Value, error) {
 
 	switch char {
 	case 'd':
-		val, err = ParseDict(ctx)
+		val, err = parseDict(ctx)
 	case 'l':
-		val, err = ParseList(ctx)
+		val, err = parseList(ctx)
 	case 'i':
-		val, err = ParseInteger(ctx)
+		val, err = parseInteger(ctx)
 	default:
 		if unicode.IsDigit(rune(char)) {
-			val, err = ParseString(ctx)
+			val, err = parseString(ctx)
 		} else {
 			return nil, errors.New("PARSER::ERROR::UNKNOWN_CHAR")
 		}
@@ -54,7 +54,7 @@ func ParseBencode(ctx *Parser_Context) (*Bencode_Value, error) {
 
 }
 
-func ParseInteger(ctx *Parser_Context) (*Bencode_Value, error) {
+func parseInteger(ctx *ParserContext) (*BencodeValue, error) {
 
 	ctx.pos++ // Get to the next token
 
@@ -73,9 +73,9 @@ func ParseInteger(ctx *Parser_Context) (*Bencode_Value, error) {
 		return nil, err
 	}
 
-	val := Bencode_Value{
-		value_type:    Bencode_Integer,
-		integer_value: int64(digit),
+	val := BencodeValue{
+		ValueType:    BencodeInteger,
+		IntegerValue: int64(digit),
 	}
 
 	ctx.pos++
@@ -84,7 +84,7 @@ func ParseInteger(ctx *Parser_Context) (*Bencode_Value, error) {
 
 }
 
-func ParseString(ctx *Parser_Context) (*Bencode_Value, error) {
+func parseString(ctx *ParserContext) (*BencodeValue, error) {
 
 	start := ctx.pos
 
@@ -102,23 +102,23 @@ func ParseString(ctx *Parser_Context) (*Bencode_Value, error) {
 	}
 	ctx.pos++
 
-	val := Bencode_Value{
-		value_type:   Bencode_String,
-		string_value: make([]byte, str_size),
+	val := BencodeValue{
+		ValueType:   BencodeString,
+		StringValue: make([]byte, str_size),
 	}
 
-	copy(val.string_value, ctx.input[ctx.pos:ctx.pos+uint64(str_size)])
+	copy(val.StringValue, ctx.input[ctx.pos:ctx.pos+uint64(str_size)])
 
 	ctx.pos += uint64(str_size)
 
 	return &val, nil
 }
 
-func ParseList(ctx *Parser_Context) (*Bencode_Value, error) {
+func parseList(ctx *ParserContext) (*BencodeValue, error) {
 
 	ctx.pos++
 
-	val_list := make([]Bencode_Value, 10)
+	val_list := make([]BencodeValue, 10)
 
 	for {
 		if ctx.input[ctx.pos] != 'e' {
@@ -127,7 +127,7 @@ func ParseList(ctx *Parser_Context) (*Bencode_Value, error) {
 				return nil, errors.New("ERROR::PARSER::NO_MATCHING_END_TAG")
 			}
 
-			value, err := ParseBencode(ctx)
+			value, err := ctx.Parse()
 			if err != nil {
 				return nil, err
 			}
@@ -139,9 +139,9 @@ func ParseList(ctx *Parser_Context) (*Bencode_Value, error) {
 		break
 	}
 
-	val := Bencode_Value{
-		value_type: Bencode_List,
-		list_value: val_list,
+	val := BencodeValue{
+		ValueType: BencodeList,
+		ListValue: val_list,
 	}
 
 	ctx.pos++
@@ -149,11 +149,11 @@ func ParseList(ctx *Parser_Context) (*Bencode_Value, error) {
 	return &val, nil
 }
 
-func ParseDict(ctx *Parser_Context) (*Bencode_Value, error) {
+func parseDict(ctx *ParserContext) (*BencodeValue, error) {
 
 	ctx.pos++
 
-	var entries []Bencode_DictEntry
+	entries := make([]BencodeDictEntry, 0)
 
 	for {
 		if ctx.input[ctx.pos] != 'e' {
@@ -162,31 +162,29 @@ func ParseDict(ctx *Parser_Context) (*Bencode_Value, error) {
 				return nil, errors.New("ERROR::PARSER::NO_MATCHING_END_TAG")
 			}
 
-			key, err := ParseBencode(ctx)
+			key, err := ctx.Parse()
 			if err != nil {
 				return nil, err
 			}
 
-			value, err := ParseBencode(ctx)
+			value, err := ctx.Parse()
 			if err != nil {
 				return nil, err
 			}
 
-			dict_entry := Bencode_DictEntry{
-				key:   key,
-				value: value,
-			}
-
-			entries = append(entries, dict_entry)
+			entries = append(entries, BencodeDictEntry{
+				Key:   key,
+				Value: value,
+			})
 
 			continue
 		}
 		break
 	}
 
-	val := Bencode_Value{
-		value_type: Bencode_Dict,
-		dict_value: entries,
+	val := BencodeValue{
+		ValueType: BencodeDict,
+		DictValue: entries,
 	}
 
 	ctx.pos++
