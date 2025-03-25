@@ -7,12 +7,15 @@ import (
 	"unicode"
 )
 
-func NewParserContext(path string) (*ParserContext, error) {
-
+func ReadTorrent(path string) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	return data, nil
+}
+
+func NewParserContext(data []byte) (*ParserContext, error) {
 
 	ctx := ParserContext{
 		input: data,

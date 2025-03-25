@@ -74,34 +74,10 @@ func (bencodeValue *BencodeValue) serialize(w io.Writer) error {
 	return nil
 }
 
-func (bencodeValue *BencodeValue) GetStringValue() ([]byte, error) {
+func (bencodeValue *BencodeValue) GetStringValue() (string, error) {
 	if bencodeValue.ValueType == BencodeString {
-		return bencodeValue.StringValue, nil
+		return string(bencodeValue.StringValue), nil
 	} else {
-		return nil, errors.New("bencode ValueType property is not BencodeString")
-	}
-}
-
-func (bencodeValue *BencodeValue) GetIntegerValue() (int64, error) {
-	if bencodeValue.ValueType == BencodeInteger {
-		return bencodeValue.IntegerValue, nil
-	} else {
-		return 0, errors.New("bencode ValueType property is not BencodeInteger")
-	}
-}
-
-func (bencodeValue *BencodeValue) GetDictValue() ([]BencodeDictEntry, error) {
-	if bencodeValue.ValueType == BencodeDict {
-		return bencodeValue.DictValue, nil
-	} else {
-		return nil, errors.New("bencode ValueType property is not BencodeDict")
-	}
-}
-
-func (bencodeValue *BencodeValue) GetListValue() ([]BencodeValue, error) {
-	if bencodeValue.ValueType == BencodeList {
-		return bencodeValue.ListValue, nil
-	} else {
-		return nil, errors.New("bencode ValueType property is not BencodeList")
+		return "", errors.New("bencode ValueType property is not BencodeString")
 	}
 }
