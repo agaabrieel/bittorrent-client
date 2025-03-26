@@ -12,7 +12,7 @@ type Torrent struct {
 	AnnounceList [][]string
 	CreationDate int64
 	Author       string
-	InfoDict     TorrentInfoDict
+	InfoDict     *TorrentInfoDict
 	Extra        []parser.BencodeValue
 	Infohash     [sha1.Size]byte
 }
@@ -38,7 +38,6 @@ func NewTorrent() *Torrent {
 
 func (t *Torrent) Deserialize(filepath string) error {
 
-	var torrent Torrent
 	extra := make([]parser.BencodeValue, 5)
 
 	data, err := parser.ReadTorrent(filepath)
@@ -77,7 +76,7 @@ func (t *Torrent) Deserialize(filepath string) error {
 				return fmt.Errorf("invalid announce value: %w", err)
 			}
 
-			torrent.Announce = announce
+			t.Announce = announce
 
 		case "announce-list":
 
@@ -95,27 +94,27 @@ func (t *Torrent) Deserialize(filepath string) error {
 					urls = append(urls, string(url))
 				}
 
-				torrent.AnnounceList = append(torrent.AnnounceList, urls)
+				t.AnnounceList = append(t.AnnounceList, urls)
 			}
 
 		case "info":
 			t.deserializeInfoDict(entry)
 		case "creation_date":
-			torrent.CreationDate = entry.Value.IntegerValue
+			t.CreationDate = entry.Value.IntegerValue
 		case "created by":
 
 			stringValue, err := entry.Value.GetStringValue()
 			if err != nil {
 				return fmt.Errorf("invalid author name: %w", err)
 			}
-			torrent.Author = stringValue
+			t.Author = stringValue
 
 		default:
 			extra = append(extra, *entry.Value)
 		}
 	}
 
-	torrent.Extra = extra
+	t.Extra = extra
 
 	return nil
 }
@@ -184,7 +183,7 @@ func (t *Torrent) deserializeInfoDict(entry parser.BencodeDictEntry) error {
 	}
 
 	t.setInfoHash(rawInfo)
-	t.InfoDict = info
+	t.InfoDict = &info
 
 	return nil
 }

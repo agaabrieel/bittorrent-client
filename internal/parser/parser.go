@@ -33,7 +33,7 @@ func (ctx *ParserContext) Parse() (*BencodeValue, error) {
 	var err error
 
 	if ctx.pos >= ctx.size {
-		return val, errors.New("PARSER::ERROR::EOF")
+		return nil, errors.New("eof before closing tags")
 	}
 
 	char := rune(ctx.input[ctx.pos])
@@ -49,7 +49,7 @@ func (ctx *ParserContext) Parse() (*BencodeValue, error) {
 		if unicode.IsDigit(rune(char)) {
 			val, err = parseString(ctx)
 		} else {
-			return nil, errors.New("PARSER::ERROR::UNKNOWN_CHAR")
+			return nil, errors.New("unknown character")
 		}
 	}
 
@@ -127,7 +127,7 @@ func parseList(ctx *ParserContext) (*BencodeValue, error) {
 		if ctx.input[ctx.pos] != 'e' {
 
 			if ctx.pos >= uint64(len(ctx.input)) {
-				return nil, errors.New("ERROR::PARSER::NO_MATCHING_END_TAG")
+				return nil, errors.New("no matching end tag")
 			}
 
 			value, err := ctx.Parse()
