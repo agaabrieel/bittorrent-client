@@ -1,42 +1,42 @@
-package torrent
+package metainfo
 
 import (
 	"crypto/sha1"
 	"fmt"
 
-	parser "github.com/agaabrieel/bittorrent-client/internal/parser"
+	parser "github.com/agaabrieel/bittorrent-client/pkg/bencode/parser"
 )
 
-type Torrent struct {
+type TorrentMetainfo struct {
 	Announce     string
 	AnnounceList [][]string
 	CreationDate int64
 	Author       string
-	InfoDict     *TorrentInfoDict
+	InfoDict     *TorrentMetainfoDict
 	Extra        []parser.BencodeValue
 	Infohash     [sha1.Size]byte
 }
 
-type TorrentInfoDict struct {
+type TorrentMetainfoDict struct {
 	Length      uint64
 	Name        string
-	Files       []TorrentFilesDict
+	Files       []TorrentMetainfoFilesDict
 	PieceLength uint64
 	Pieces      []byte
 	Extra       []parser.BencodeValue
 }
 
-type TorrentFilesDict struct {
+type TorrentMetainfoFilesDict struct {
 	Len  uint64
 	Path string
 }
 
-func NewTorrent() *Torrent {
-	var t Torrent
+func NewTorrent() *TorrentMetainfo {
+	var t TorrentMetainfo
 	return &t
 }
 
-func (t *Torrent) Deserialize(filepath string) error {
+func (t *TorrentMetainfo) Parse(filepath string) error {
 
 	extra := make([]parser.BencodeValue, 5)
 
@@ -98,7 +98,7 @@ func (t *Torrent) Deserialize(filepath string) error {
 			}
 
 		case "info":
-			t.deserializeInfoDict(entry)
+			t.parseInfoDict(entry)
 		case "creation_date":
 			t.CreationDate = entry.Value.IntegerValue
 		case "created by":
@@ -119,14 +119,14 @@ func (t *Torrent) Deserialize(filepath string) error {
 	return nil
 }
 
-func (t *Torrent) deserializeInfoDict(entry parser.BencodeDictEntry) error {
+func (t *TorrentMetainfo) parseInfoDict(entry parser.BencodeDictEntry) error {
 
 	rawInfo, err := entry.Value.Serialize()
 	if err != nil {
 		return fmt.Errorf("error parsing infohash: %w", err)
 	}
 
-	var info TorrentInfoDict
+	var info TorrentMetainfoDict
 	infoDict := entry.Value.DictValue
 	for _, entry := range infoDict {
 
@@ -169,7 +169,7 @@ func (t *Torrent) deserializeInfoDict(entry parser.BencodeDictEntry) error {
 
 			files := entry.Value.ListValue
 			for _, fileDict := range files {
-				file := TorrentFilesDict{
+				file := TorrentMetainfoFilesDict{
 					Len:  uint64(fileDict.DictValue[0].Value.IntegerValue),
 					Path: string(fileDict.DictValue[0].Value.StringValue),
 				}
@@ -188,7 +188,7 @@ func (t *Torrent) deserializeInfoDict(entry parser.BencodeDictEntry) error {
 	return nil
 }
 
-func (t *Torrent) setInfoHash(raw []byte) {
+func (t *TorrentMetainfo) setInfoHash(raw []byte) {
 	hash := sha1.New()
 	t.Infohash = [20]byte(hash.Sum(raw))
 }
