@@ -13,8 +13,10 @@ import (
 	"sync"
 	"time"
 
-	parser "github.com/agaabrieel/bittorrent-client/internal/parser"
-	torrent "github.com/agaabrieel/bittorrent-client/internal/torrent"
+	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
+	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"
+	peer "github.com/agaabrieel/bittorrent-client/pkg/peers"
+	tracker "github.com/agaabrieel/bittorrent-client/pkg/tracker"
 )
 
 type PieceManager struct {
@@ -23,15 +25,15 @@ type PieceManager struct {
 type BitTorrentClient struct {
 	id           [20]byte
 	port         int
-	Torrent      *torrent.Torrent
-	Peers        []Peer
+	Torrent      *metainfo.TorrentMetainfo
+	Peers        []peer.Peer
 	PieceManager *PieceManager
-	Trackers     []Tracker
+	Trackers     []tracker.Tracker
 }
 
-func NewBittorrentClient(port int, t *torrent.Torrent) (*BitTorrentClient, error) {
+func NewBittorrentClient(port int, t *metainfo.TorrentMetainfo) (*BitTorrentClient, error) {
 
-	var trackers []Tracker
+	var trackers []tracker.Tracker
 
 	if len(t.AnnounceList) != 0 {
 		for tierVal, tier := range t.AnnounceList {
@@ -40,7 +42,7 @@ func NewBittorrentClient(port int, t *torrent.Torrent) (*BitTorrentClient, error
 				if err != nil {
 					return nil, err
 				}
-				trackers = append(trackers, Tracker{
+				trackers = append(trackers, tracker.Tracker{
 					url:      *baseUrl,
 					tier:     uint8(tierVal),
 					interval: time.Duration(0),

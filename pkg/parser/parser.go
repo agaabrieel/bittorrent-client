@@ -7,7 +7,7 @@ import (
 	"unicode"
 )
 
-func ReadTorrent(path string) ([]byte, error) {
+func ReadTorrentFile(path string) ([]byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

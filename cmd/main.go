@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 
-	client "github.com/agaabrieel/bittorrent-client/internal/client"
-	torrent "github.com/agaabrieel/bittorrent-client/internal/torrent"
+	client "github.com/agaabrieel/bittorrent-client/pkg/client"
+	torrent "github.com/agaabrieel/bittorrent-client/pkg/torrent"
 )
 
 func main() {
