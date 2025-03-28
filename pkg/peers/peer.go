@@ -46,7 +46,7 @@ type Peer struct {
 	Conn PeerConn
 }
 
-func NewPeerManager(peers []Peer, pieceManager *piece.PieceManager, metainfo *metainfo.TorrentMetainfo) *PeerManager {
+func NewPeerManager(peers []Peer, pieceManager *piece.PieceManager) *PeerManager {
 	mngr := PeerManager{
 		Peers:        peers,
 		PieceManager: pieceManager,

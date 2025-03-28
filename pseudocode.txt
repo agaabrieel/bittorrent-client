@@ -2,3 +2,5 @@ START
 
 init torrent
 init parser
+parse torrent > metainfo
+init TrackerManager(metainfo)
