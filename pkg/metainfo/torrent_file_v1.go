@@ -31,7 +31,7 @@ type TorrentMetainfoFilesDict struct {
 	Path string
 }
 
-func NewTorrent() *TorrentMetainfo {
+func NewMetainfo() *TorrentMetainfo {
 	var t TorrentMetainfo
 	return &t
 }

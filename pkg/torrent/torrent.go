@@ -1,4 +1,5 @@
 package torrent
+<<<<<<< HEAD
 
 import (
 	"crypto/rand"
@@ -59,3 +60,5 @@ func (t *Torrent) MainLoop() {
 
 	for
 }
+=======
+>>>>>>> baf0fc0fe71295921a5f9cd6ed5eb1582b1ae21b
