@@ -18,9 +18,9 @@ import (
 	peer "github.com/agaabrieel/bittorrent-client/pkg/peers"
 )
 
-type Action uint8
-
 const ProtocolID uint64 = 0x41727101980
+
+type Action uint8
 
 const (
 	ConnectAction Action = iota
@@ -29,26 +29,18 @@ const (
 	ErrorAction
 )
 
-type TrackerClient interface {
+type Client interface {
 	Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error)
 }
 
-type HTTPTrackerClient struct {
+type HTTPClient struct {
 	Client *http.Client
 }
 
-type UDPTrackerClient struct {
+type UDPClient struct {
 	Dialer  *net.Dialer
 	connIds map[string]uint64
 	mutex   sync.Mutex
-}
-
-type Tracker struct {
-	TrackerClient
-	Url      url.URL
-	Interval time.Duration
-	Tier     uint8
-	Request  AnnounceRequest
 }
 
 type AnnounceRequest struct {
@@ -67,45 +59,35 @@ type AnnounceResponse struct {
 	// ... other fields
 }
 
-func NewAnnounceRequest(hash [20]byte, id [20]byte) *AnnounceRequest {
-	req := AnnounceRequest{
-		InfoHash: hash,
-		PeerID:   id,
-	}
-	return &req
+type Tracker struct {
+	Client
+	Url      url.URL
+	Interval time.Duration
 }
 
-func NewTracker(trackerUrl url.URL, client *http.Client, dialer *net.Dialer, tier ...uint8) *Tracker {
+func NewTracker(trackerUrl url.URL) Tracker {
 
-	if client == nil {
-		client = &http.Client{
-			Timeout: 30 * time.Second,
-		}
-	}
-	if dialer == nil {
-		dialer = &net.Dialer{
-			Timeout: 30 * time.Second,
-		}
-	}
-
-	var tc TrackerClient
+	var tc Client
 	if trackerUrl.Scheme == "udp" {
-		tc = &UDPTrackerClient{
-			Dialer: dialer,
+		tc = &UDPClient{
+			Dialer: &net.Dialer{
+				Timeout: time.Duration(time.Second * 45),
+			},
 		}
 	} else if trackerUrl.Scheme == "http" || trackerUrl.Scheme == "https" {
-		tc = &HTTPTrackerClient{
-			Client: client,
+		tc = &HTTPClient{
+			Client: &http.Client{
+				Timeout: time.Duration(time.Second * 45),
+			},
 		}
 	} else {
-		return nil
+		return Tracker{}
 	}
 
-	return &Tracker{
-		TrackerClient: tc,
-		Url:           trackerUrl,
-		Interval:      time.Duration(0),
-		Tier:          tier[0],
+	return Tracker{
+		Client:   tc,
+		Url:      trackerUrl,
+		Interval: time.Duration(0),
 	}
 }
 
@@ -113,12 +95,12 @@ func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req Announce
 
 	defer wg.Done()
 
-	if t.TrackerClient == nil {
+	if t.Client == nil {
 		errCh <- errors.New("tracker does not implement client")
 		return
 	}
 
-	resp, err := t.TrackerClient.Announce(ctx, t.Url, req)
+	resp, err := t.Client.Announce(ctx, t.Url, req)
 	if err != nil {
 		errCh <- fmt.Errorf("failed tracker announce: %w", err)
 	}
@@ -132,7 +114,128 @@ func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req Announce
 	respCh <- resp
 }
 
-func (c *UDPTrackerClient) makeAnnounceRequest(ctx context.Context, connId uint64, req AnnounceRequest, conn net.Conn) (AnnounceResponse, error) {
+func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error) {
+
+	var announceResp AnnounceResponse
+
+	if c.Dialer == nil {
+		return AnnounceResponse{}, fmt.Errorf("client has no valid dialer")
+	}
+
+	serverAddr, err := net.ResolveUDPAddr("udp", trackerUrl.String())
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("failed to resolve UDP address: %w", err)
+	}
+
+	conn, err := c.Dialer.DialContext(ctx, "udp", serverAddr.String())
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("failed to connect to tracker: %w", err)
+	}
+	defer conn.Close()
+
+	c.mutex.Lock()
+	cachedConnId, found := c.connIds[trackerUrl.Host]
+	c.mutex.Unlock()
+
+	if found { // IF CONNECTION ID ALREADY EXISTS, SKIP CONNECTION REQUEST
+		connId := cachedConnId
+		announceResp, err = c.makeAnnounceRequest(ctx, connId, req, conn)
+		if err != nil {
+			err = fmt.Errorf("failed to make announce request: %w", err)
+			errors.Join(err, errors.New("connection id may have expired, retrying"))
+
+			c.mutex.Lock()
+			if currentId, stillExists := c.connIds[trackerUrl.Host]; stillExists && currentId == cachedConnId {
+				delete(c.connIds, trackerUrl.Host)
+			}
+			c.mutex.Unlock()
+
+		} else {
+			return announceResp, nil
+		}
+	}
+
+	connId, err := c.makeConnectionRequest(ctx, conn)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("failed to make connection request: %w", err)
+	}
+
+	c.mutex.Lock()
+	c.connIds[trackerUrl.Host] = connId
+	c.mutex.Unlock()
+
+	announceResp, err = c.makeAnnounceRequest(ctx, connId, req, conn)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("failed to make announce request: %w", err)
+	}
+
+	return announceResp, nil
+
+}
+
+func (c *HTTPClient) Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error) {
+
+	if c.Client == nil {
+		return AnnounceResponse{}, errors.New("tracker client is nil")
+	}
+
+	params := url.Values{}
+	params.Set("info_hash", string(req.InfoHash[:]))
+	params.Set("peer_id", string(req.PeerID[:]))
+	params.Set("port", strconv.Itoa(int(req.Port)))
+
+	uploaded := strconv.Itoa(int(req.Uploaded))
+	params.Set("uploaded", uploaded)
+
+	dowloaded := strconv.Itoa(int(req.Downloaded))
+	params.Set("downloaded", dowloaded)
+
+	left := strconv.Itoa(int(req.Left))
+	params.Set("left", left)
+
+	params.Set("compact", string("1"))
+	if req.Event != "" {
+		params.Set("event", req.Event)
+	}
+
+	finalUrl := trackerUrl
+	finalUrl.RawQuery = params.Encode()
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, finalUrl.String(), nil)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("failed to create request context: %w", err)
+	}
+
+	resp, err := c.Client.Do(httpReq)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("failed to make tracker requerst: %w", err)
+	}
+	defer resp.Body.Close()
+
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("failed to read tracker response: %w", err)
+	}
+
+	parserCtx, err := parser.NewParserContext(b)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("parser context creation failed: %w", err)
+	}
+
+	rootDict, err := parserCtx.Parse()
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("response parsing failed: %w", err)
+	}
+
+	announceResp, err := parseAnnounceResponse(rootDict)
+	if err != nil {
+		return AnnounceResponse{}, fmt.Errorf("response parsing failed: %w", err)
+	}
+	return announceResp, nil
+
+}
+
+func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req AnnounceRequest, conn net.Conn) (AnnounceResponse, error) {
 
 	var announceTransactionIDBytes [4]byte
 	if _, err := io.ReadFull(rand.Reader, announceTransactionIDBytes[:]); err != nil {
@@ -224,7 +327,7 @@ func (c *UDPTrackerClient) makeAnnounceRequest(ctx context.Context, connId uint6
 	return announceResp, nil
 }
 
-func (c *UDPTrackerClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (uint64, error) {
+func (c *UDPClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (uint64, error) {
 
 	msg := make([]byte, 16) // creates buffer for connect  message
 
@@ -289,7 +392,7 @@ func (c *UDPTrackerClient) makeConnectionRequest(ctx context.Context, conn net.C
 
 }
 
-func (c *UDPTrackerClient) generateAnnounceMsg(transactionId uint32, req AnnounceRequest, connId uint64) []byte {
+func (c *UDPClient) generateAnnounceMsg(transactionId uint32, req AnnounceRequest, connId uint64) []byte {
 
 	announceMsg := make([]byte, 98)
 
@@ -322,127 +425,6 @@ func (c *UDPTrackerClient) generateAnnounceMsg(transactionId uint32, req Announc
 	binary.BigEndian.PutUint16(announceMsg[96:98], req.Port)
 
 	return announceMsg
-}
-
-func (c *UDPTrackerClient) Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error) {
-
-	var announceResp AnnounceResponse
-
-	if c.Dialer == nil {
-		return AnnounceResponse{}, fmt.Errorf("client has no valid dialer")
-	}
-
-	serverAddr, err := net.ResolveUDPAddr("udp", trackerUrl.String())
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to resolve UDP address: %w", err)
-	}
-
-	conn, err := c.Dialer.DialContext(ctx, "udp", serverAddr.String())
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to connect to tracker: %w", err)
-	}
-	defer conn.Close()
-
-	c.mutex.Lock()
-	cachedConnId, found := c.connIds[trackerUrl.Host]
-	c.mutex.Unlock()
-
-	if found { // IF CONNECTION ID ALREADY EXISTS, SKIP CONNECTION REQUEST
-		connId := cachedConnId
-		announceResp, err = c.makeAnnounceRequest(ctx, connId, req, conn)
-		if err != nil {
-			err = fmt.Errorf("failed to make announce request: %w", err)
-			errors.Join(err, errors.New("connection id may have expired, retrying"))
-
-			c.mutex.Lock()
-			if currentId, stillExists := c.connIds[trackerUrl.Host]; stillExists && currentId == cachedConnId {
-				delete(c.connIds, trackerUrl.Host)
-			}
-			c.mutex.Unlock()
-
-		} else {
-			return announceResp, nil
-		}
-	}
-
-	connId, err := c.makeConnectionRequest(ctx, conn)
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to make connection request: %w", err)
-	}
-
-	c.mutex.Lock()
-	c.connIds[trackerUrl.Host] = connId
-	c.mutex.Unlock()
-
-	announceResp, err = c.makeAnnounceRequest(ctx, connId, req, conn)
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to make announce request: %w", err)
-	}
-
-	return announceResp, nil
-
-}
-
-func (c *HTTPTrackerClient) Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error) {
-
-	if c.Client == nil {
-		return AnnounceResponse{}, errors.New("tracker client is nil")
-	}
-
-	params := url.Values{}
-	params.Set("info_hash", string(req.InfoHash[:]))
-	params.Set("peer_id", string(req.PeerID[:]))
-	params.Set("port", strconv.Itoa(int(req.Port)))
-
-	uploaded := strconv.Itoa(int(req.Uploaded))
-	params.Set("uploaded", uploaded)
-
-	dowloaded := strconv.Itoa(int(req.Downloaded))
-	params.Set("downloaded", dowloaded)
-
-	left := strconv.Itoa(int(req.Left))
-	params.Set("left", left)
-
-	params.Set("compact", string("1"))
-	if req.Event != "" {
-		params.Set("event", req.Event)
-	}
-
-	finalUrl := trackerUrl
-	finalUrl.RawQuery = params.Encode()
-
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, finalUrl.String(), nil)
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to create request context: %w", err)
-	}
-
-	resp, err := c.Client.Do(httpReq)
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to make tracker requerst: %w", err)
-	}
-	defer resp.Body.Close()
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to read tracker response: %w", err)
-	}
-
-	parserCtx, err := parser.NewParserContext(b)
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("parser context creation failed: %w", err)
-	}
-
-	rootDict, err := parserCtx.Parse()
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("response parsing failed: %w", err)
-	}
-
-	announceResp, err := parseAnnounceResponse(rootDict)
-	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("response parsing failed: %w", err)
-	}
-	return announceResp, nil
-
 }
 
 func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) {

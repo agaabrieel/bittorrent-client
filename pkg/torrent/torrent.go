@@ -1,7 +1,6 @@
 package torrent
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"net/url"
@@ -14,10 +13,13 @@ import (
 )
 
 type Torrent struct {
+	Id           [20]byte
 	Metainfo     *metainfo.TorrentMetainfo
 	Trackers     []tracker.Tracker
 	PeerManager  *peer.PeerManager
 	PieceManager *piece.PieceManager
+	WaitGroup    *sync.WaitGroup
+	Mutex        *sync.Mutex
 }
 
 func NewTorrent(filepath string) (*Torrent, error) {
@@ -25,36 +27,35 @@ func NewTorrent(filepath string) (*Torrent, error) {
 	var t Torrent
 
 	meta := metainfo.NewTorrent()
-	err := meta.Deserialize(filepath)
-
-	if err != nil {
+	if err := meta.Deserialize(filepath); err != nil {
 		return nil, fmt.Errorf("failed to parse torrent file: %w", err)
 	}
 
 	for _, tier := range meta.AnnounceList {
 		for _, baseUrl := range tier {
-			url, err := url.Parse(baseUrl)
+			parsedUrl, err := url.Parse(baseUrl)
 			if err != nil {
 				continue
 			}
 
-			tracker := tracker.NewTracker(*url, nil, nil)
-			t.Trackers = append(t.Trackers, *tracker)
+			tracker := tracker.NewTracker(*parsedUrl)
+			t.Trackers = append(t.Trackers, tracker)
 		}
 	}
 
-	id := make([]byte, 20)
-	rand.Read(id)
+	rand.Read(t.Id[:])
+	t.Metainfo = meta
+	t.Mutex = &sync.Mutex{}
+	t.WaitGroup = &sync.WaitGroup{}
 
-	req := tracker.NewAnnounceRequest(meta.Infohash, id)
+	return &t, nil
 
-	errCh := make(chan<- error, 100)
-	respCh := make(chan<- tracker.AnnounceResponse, 100)
-	var wg sync.WaitGroup
-	for _, tracker := range t.Trackers {
-		wg.Add(1)
-		go tracker.Announce(&wg, context.Background(), *req, respCh, errCh)
-	}
+}
 
-	wg.Wait()
+func (t *Torrent) MainLoop() {
+	
+	responseCh := make(chan tracker.AnnounceResponse, 10)
+	errCh := make(chan error, 10)
+
+	for
 }
