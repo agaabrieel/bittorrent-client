@@ -1,4 +1,4 @@
-package torrent
+package session
 
 import (
 	"crypto/rand"
@@ -12,7 +12,13 @@ import (
 	tracker "github.com/agaabrieel/bittorrent-client/pkg/tracker"
 )
 
-type Torrent struct {
+type ChannelMessage uint8
+
+const (
+
+)
+
+type TorrentSession struct {
 	Id           [20]byte
 	Metainfo     *metainfo.TorrentMetainfo
 	Trackers     []tracker.Tracker
@@ -22,9 +28,9 @@ type Torrent struct {
 	Mutex        *sync.Mutex
 }
 
-func NewTorrent(filepath string) (*Torrent, error) {
+func NewTorrentSession(filepath string) (*TorrentSession, error) {
 
-	var t Torrent
+	var t TorrentSession
 
 	meta := metainfo.NewTorrent()
 	if err := meta.Deserialize(filepath); err != nil {
@@ -52,7 +58,7 @@ func NewTorrent(filepath string) (*Torrent, error) {
 
 }
 
-func (t *Torrent) MainLoop() {
+func (t *TorrentSession) MainLoop() {
 	
 	responseCh := make(chan tracker.AnnounceResponse, 10)
 	errCh := make(chan error, 10)
