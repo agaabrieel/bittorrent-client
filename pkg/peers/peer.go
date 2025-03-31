@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/bits"
 	"net"
 	"strconv"
 	"sync"
@@ -33,7 +34,8 @@ const (
 	Request       PeerMessageType = 0x06
 	Piece         PeerMessageType = 0x07
 	Cancel        PeerMessageType = 0x08
-	KeepAlive     PeerMessageType = 0x09 // NOT PROTOCOL-COMPLIANT
+	Port          PeerMessageType = 0x09 // DHT
+	KeepAlive     PeerMessageType = 0x10 // NOT PROTOCOL-COMPLIANT
 )
 
 type PeerManager struct {
@@ -48,15 +50,17 @@ type PeerManager struct {
 }
 
 type Peer struct {
-	Id         [20]byte
-	Ip         net.IP
-	Port       uint16
-	Conn       net.Conn
-	Bitfield   BitfieldMask
-	Interested bool
-	Choke      bool
-	LastActive  time.Time
-	LastMessage PeerMessage
+	Id            [20]byte
+	Ip            net.IP
+	Port          uint16
+	Conn          net.Conn
+	Bitfield      BitfieldMask
+	IsInterested  bool
+	IsInteresting bool
+	IsChoked      bool
+	IsChoking     bool
+	LastActive    time.Time
+	LastMessage   PeerMessage
 }
 
 func NewPeerManager(peers []Peer, pieceManager *piece.PieceManager, metainfo *metainfo.TorrentMetainfo) *PeerManager {
@@ -96,7 +100,7 @@ func (mngr *PeerManager) handlePeer(wg *sync.WaitGroup, p *Peer, ctx context.Con
 		return fmt.Errorf("failed to resolve tcp address from peer: %w", err)
 	}
 
-	conn, err := doHandshake(p, ctx, *addr, hash, id)
+	err = doHandshake(p, ctx, *addr, hash, id)
 	if err != nil {
 		return fmt.Errorf("failed to establish handshake with peer %x: %w", p.Id[:], err)
 	}
@@ -104,55 +108,115 @@ func (mngr *PeerManager) handlePeer(wg *sync.WaitGroup, p *Peer, ctx context.Con
 	recvCh := make(chan PeerMessage, 1024)
 	sendCh := make(chan []byte, 1024)
 
-	go writeLoop(ctx, conn, sendCh)
-	go readLoop(ctx, conn, recvCh)
+	go writeLoop(p, ctx, sendCh)
+	go readLoop(p, ctx, recvCh)
 
 	for {
 		select {
 		case msg := <-recvCh:
-			p.Conn.LastMessage = msg
+			p.LastMessage = msg
 			switch msg.messageType {
+
 			case Choke:
-				p.Choke = true
+
+				p.IsChoking = true
 				break
+
 			case Unchoke:
-				p.Choke = false
+
+				p.IsChoking = false
+				wantedPieces := mngr.getWantedPieces(p)
+				idx := findFirstNonZeroBit(wantedPieces)
+				var resp []byte
+
+				if idx != -1 {
+					resp, err = mngr.generateMsg(Request)
+					if err != nil {
+						return err
+					}
+					sendCh <- resp
+				}
 				break
+
 			case NotInterested:
-				p.Interested = false
+
+				p.IsInterested = false
 				break
+
 			case Interested:
-				p.Interested = true
+
+				var resp []byte
+				p.IsInterested = true
+				if p.IsChoked {
+					resp, err = mngr.generateMsg(Unchoke)
+					if err != nil {
+						return err
+					}
+					sendCh <- resp
+				}
 				break
+
 			case Bitfield:
+
 				p.Bitfield = msg.data
-				mngr.setWantedPieces(p)
+				wantedPieces := mngr.getWantedPieces(p)
+				idx := findFirstNonZeroBit(wantedPieces)
+				var resp []byte
+
+				if p.IsChoking {
+					if idx != -1 {
+						resp, err = mngr.generateMsg(Interested)
+						if err != nil {
+							return err
+						}
+						sendCh <- resp
+					}
+				}
+				break
 
 			case Have:
-				mngr.evaluatePeerBitfield(Bitfield)
-				sendCh <- Interested
-			case Request:
 
+				pieceIdx := binary.BigEndian.Uint32(msg.data[5:])
+				p.Bitfield.SetPiece(pieceIdx)
+
+				var resp []byte
+				if !mngr.Bitfield.HasPiece(pieceIdx) {
+					p.IsInteresting = true
+					if p.IsChoking {
+						resp, err = mngr.generateMsg(Interested)
+						if err != nil {
+							return err
+						}
+					} else {
+						resp, err = mngr.generateMsg(Request)
+						if err != nil {
+							return err
+						}
+					}
+				} else {
+					resp, err = mngr.generateMsg(NotInterested)
+					if err != nil {
+						return err
+					}
+				}
+				sendCh <- resp
+
+			case Request:
+				// send piece
 			case Piece:
+				// send piece to piece manager
 			}
 		case <-time.After(time.Second * 120):
-			sendCh <- mngr.gen
-		}
-
-		if p.Choke {
-			continue
-		} else if {
 
 		}
 	}
-	return nil
 }
 
-func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, id [20]byte) (net.Conn, error) {
+func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, id [20]byte) error {
 	// Dials connection
 	conn, err := net.Dial("tcp", addr.String())
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to peer: %w", err)
+		return fmt.Errorf("failed to connect to peer: %w", err)
 	}
 	defer func() {
 		if err != nil {
@@ -170,7 +234,7 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 
 	if Handshake.Len() != 68 {
 		err = fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len())
-		return nil, err
+		return err
 	}
 
 	// Sets write deadline
@@ -183,7 +247,7 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 	// Writes handshake message
 	_, err = conn.Write(Handshake.Bytes())
 	if err != nil {
-		return nil, fmt.Errorf("failed to write to peer: %w", err)
+		return fmt.Errorf("failed to write to peer: %w", err)
 	}
 	// Sets read deadline
 	if deadline, ok := ctx.Deadline(); ok {
@@ -195,29 +259,30 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 	// zeroes buffer and reads handshake response
 	responseBuffer := make([]byte, 68)
 	if _, err := io.ReadFull(conn, responseBuffer); err != nil {
-		return nil, fmt.Errorf("couldn't read handshake: %w", err)
+		return fmt.Errorf("couldn't read handshake: %w", err)
 	}
 
 	if !bytes.Equal(responseBuffer[0:28], Handshake.Bytes()[:28]) {
-		return nil, fmt.Errorf("peer sent incorrect handshake")
+		return fmt.Errorf("peer sent incorrect handshake")
 	}
 
 	if !bytes.Equal(responseBuffer[28:48], Handshake.Bytes()[28:48]) {
-		return nil, fmt.Errorf("info hash sent by peer doesn't match ours")
+		return fmt.Errorf("info hash sent by peer doesn't match ours")
 	}
 
 	peerID := *(*[20]byte)(responseBuffer[48:68])
 	if p.Id != peerID && p.Id != [20]byte{} {
-		return nil, fmt.Errorf("peer ID changed: was %x, now %x", p.Id, peerID)
+		return fmt.Errorf("peer ID changed: was %x, now %x", p.Id, peerID)
 	}
 
 	p.Id = peerID
-	p.Conn = PeerConn{
-		Conn:       conn,
-		LastActive: time.Now(),
-	}
+	p.IsChoked = true
+	p.IsInterested = false
+	p.IsChoking = true
+	p.IsInteresting = false
+	p.Conn = conn
 
-	return conn, nil
+	return nil
 }
 
 func readLoop(p *Peer, ctx context.Context, recvCh chan<- PeerMessage) {
@@ -316,9 +381,9 @@ func writeLoop(p *Peer, ctx context.Context, sendCh <-chan []byte) {
 	}
 }
 
-func (mngr *PeerManager) generateMsg(msg PeerMessage) ([]byte, error) {
+func (mngr *PeerManager) generateMsg(msgType PeerMessageType) ([]byte, error) {
 
-	switch msg.messageType {
+	switch msgType {
 	case KeepAlive:
 		buf := make([]byte, 4)
 		binary.BigEndian.PutUint32(buf, 0)
@@ -330,54 +395,65 @@ func (mngr *PeerManager) generateMsg(msg PeerMessage) ([]byte, error) {
 	case NotInterested:
 		buf := make([]byte, 5) // 4 bytes for length prefix + 1 byte for message id
 		binary.BigEndian.PutUint32(buf, 1)
-		buf[4] = byte(msg.messageType)
+		buf[4] = byte(msgType)
 		return buf, nil
 
 	case Have:
-		if len(msg.data) != 4 {
-			return nil, fmt.Errorf("malformed message, expected 4 bytes, got %d", len(msg.data))
-		}
 
 		buf := make([]byte, 9) // 4 bytes for length prefix, 1 byte for message id and 4 bytes for piece index
 		binary.BigEndian.PutUint32(buf, 5)
-		buf[4] = byte(msg.messageType)
-		copy(buf[5:], msg.data)
+		buf[4] = byte(msgType)
+		copy(buf[5:], mngr.Bitfield)
 		return buf, nil
 
 	case Request:
 	case Cancel:
 		buf := make([]byte, 17)
 		binary.BigEndian.PutUint32(buf, 13)
-		buf[4] = byte(msg.messageType)
-		copy(buf[5:], msg.data)
+		buf[4] = byte(msgType)
+		copy(buf[5:], msg)
 		return buf, nil
 
 	case Bitfield:
 		buf := make([]byte, len(msg.data)+5)
 		binary.BigEndian.PutUint32(buf, uint32(len(msg.data)+1))
-		buf[4] = byte(msg.messageType)
-		copy(buf[5:], msg.data)
+		buf[4] = byte(msgType)
+		copy(buf[5:], mngr.Bitfield)
 		return buf, nil
 
 	case Piece:
 		buf := make([]byte, len(msg.data)+13)
 		binary.BigEndian.PutUint32(buf, uint32(len(msg.data)+9))
-		buf[4] = byte(msg.messageType)
-		copy(buf[5:], msg.data)
+		buf[4] = byte(msgType)
+		copy(buf[5:], msg)
 		return buf, nil
 	}
 	return nil, fmt.Errorf("message type %v is invalid", msg.messageType)
 }
 
-func (mngr *PeerManager) setWantedPieces(p *Peer) {
+func (mngr *PeerManager) getWantedPieces(p *Peer) BitfieldMask {
+
+	var WantedPieces BitfieldMask
 
 	mngr.mutex.Lock()
 	defer mngr.mutex.Unlock()
-	for i, _ := range mngr.WantedPieces {
-		mngr.WantedPieces[i] = ((mngr.Bitfield[i] ^ p.Bitfield[i]) & p.Bitfield[i])
+	for i, _ := range mngr.Bitfield {
+		WantedPieces[i] = ((mngr.Bitfield[i] ^ p.Bitfield[i]) & p.Bitfield[i])
 	}
 
+	return WantedPieces
 	// Xor gets pieces that the client or the peer have, but not both
 	// And gets pieces the the client has, i.e, that we don't but they have
 
+}
+
+func findFirstNonZeroBit(bytes []byte) int {
+	for i, byte := range bytes {
+		if byte == 0 {
+			continue
+		}
+		bitIdx := bits.Len(uint(byte)) - 1
+		return i + bitIdx
+	}
+	return -1
 }
