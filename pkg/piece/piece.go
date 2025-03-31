@@ -7,4 +7,7 @@ type PieceManager struct {
 }
 
 type Piece struct {
+	Index uint32
+	Begin uint32
+	Data  []byte
 }

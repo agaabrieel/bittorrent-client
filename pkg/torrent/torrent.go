@@ -15,7 +15,7 @@ import (
 type ChannelMessage uint8
 
 const (
-
+	GetBitfield ChannelMessage = iota
 )
 
 type TorrentSession struct {

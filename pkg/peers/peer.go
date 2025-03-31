@@ -130,10 +130,7 @@ func (mngr *PeerManager) handlePeer(wg *sync.WaitGroup, p *Peer, ctx context.Con
 				var resp []byte
 
 				if idx != -1 {
-					resp, err = mngr.generateMsg(Request)
-					if err != nil {
-						return err
-					}
+					resp = mngr.generateRequestMsg()
 					sendCh <- resp
 				}
 				break
@@ -148,10 +145,7 @@ func (mngr *PeerManager) handlePeer(wg *sync.WaitGroup, p *Peer, ctx context.Con
 				var resp []byte
 				p.IsInterested = true
 				if p.IsChoked {
-					resp, err = mngr.generateMsg(Unchoke)
-					if err != nil {
-						return err
-					}
+					resp = mngr.generateNoPayloadMsg(Unchoke)
 					sendCh <- resp
 				}
 				break
@@ -165,10 +159,7 @@ func (mngr *PeerManager) handlePeer(wg *sync.WaitGroup, p *Peer, ctx context.Con
 
 				if p.IsChoking {
 					if idx != -1 {
-						resp, err = mngr.generateMsg(Interested)
-						if err != nil {
-							return err
-						}
+						resp = mngr.generateNoPayloadMsg(Interested)
 						sendCh <- resp
 					}
 				}
@@ -183,28 +174,24 @@ func (mngr *PeerManager) handlePeer(wg *sync.WaitGroup, p *Peer, ctx context.Con
 				if !mngr.Bitfield.HasPiece(pieceIdx) {
 					p.IsInteresting = true
 					if p.IsChoking {
-						resp, err = mngr.generateMsg(Interested)
-						if err != nil {
-							return err
-						}
+						resp = mngr.generateNoPayloadMsg(Interested)
 					} else {
-						resp, err = mngr.generateMsg(Request)
-						if err != nil {
-							return err
-						}
+						resp = mngr.generateRequestMsg()
 					}
 				} else {
-					resp, err = mngr.generateMsg(NotInterested)
-					if err != nil {
-						return err
-					}
+					resp = mngr.generateNoPayloadMsg(NotInterested)
 				}
 				sendCh <- resp
 
 			case Request:
 				// send piece
 			case Piece:
-				// send piece to piece manager
+				mngr.PieceManagerSendCh <- piece.Piece{
+					Index: binary.BigEndian.Uint32(msg.data[5:9]),
+					Begin: binary.BigEndian.Uint32(msg.data[9:13]),
+					Data:  msg.data[13:],
+				}
+				pieceManagerResponse := <-mngr.PieceManagerRecvCh
 			}
 		case <-time.After(time.Second * 120):
 
@@ -381,54 +368,54 @@ func writeLoop(p *Peer, ctx context.Context, sendCh <-chan []byte) {
 	}
 }
 
-func (mngr *PeerManager) generateMsg(msgType PeerMessageType) ([]byte, error) {
+func (mngr *PeerManager) generateNoPayloadMsg(msgType PeerMessageType) []byte {
 
 	switch msgType {
 	case KeepAlive:
 		buf := make([]byte, 4)
 		binary.BigEndian.PutUint32(buf, 0)
-		return buf, nil
+		return buf
 
-	case Choke:
-	case Unchoke:
-	case Interested:
-	case NotInterested:
+	default:
 		buf := make([]byte, 5) // 4 bytes for length prefix + 1 byte for message id
 		binary.BigEndian.PutUint32(buf, 1)
 		buf[4] = byte(msgType)
-		return buf, nil
-
-	case Have:
-
-		buf := make([]byte, 9) // 4 bytes for length prefix, 1 byte for message id and 4 bytes for piece index
-		binary.BigEndian.PutUint32(buf, 5)
-		buf[4] = byte(msgType)
-		copy(buf[5:], mngr.Bitfield)
-		return buf, nil
-
-	case Request:
-	case Cancel:
-		buf := make([]byte, 17)
-		binary.BigEndian.PutUint32(buf, 13)
-		buf[4] = byte(msgType)
-		copy(buf[5:], msg)
-		return buf, nil
-
-	case Bitfield:
-		buf := make([]byte, len(msg.data)+5)
-		binary.BigEndian.PutUint32(buf, uint32(len(msg.data)+1))
-		buf[4] = byte(msgType)
-		copy(buf[5:], mngr.Bitfield)
-		return buf, nil
-
-	case Piece:
-		buf := make([]byte, len(msg.data)+13)
-		binary.BigEndian.PutUint32(buf, uint32(len(msg.data)+9))
-		buf[4] = byte(msgType)
-		copy(buf[5:], msg)
-		return buf, nil
+		return buf
 	}
-	return nil, fmt.Errorf("message type %v is invalid", msg.messageType)
+}
+
+func (mngr *PeerManager) generateHaveMsg(idx uint32) []byte {
+	buf := make([]byte, 9) // 4 bytes for length prefix, 1 byte for message id and 4 bytes for piece index
+	binary.BigEndian.PutUint32(buf, 5)
+	buf[4] = byte(Have)
+	binary.BigEndian.PutUint32(buf[5:], idx)
+	return buf
+}
+
+func (mngr *PeerManager) generateRequestMsg(idx uint32, offset uint32, len uint32) []byte {
+	buf := make([]byte, 17)
+	binary.BigEndian.PutUint32(buf, 13)
+	buf[4] = byte(Request)
+	binary.BigEndian.PutUint32(buf[5:9], idx)
+	binary.BigEndian.PutUint32(buf[9:13], offset)
+	binary.BigEndian.PutUint32(buf[13:17], len)
+	return buf
+}
+
+func (mngr *PeerManager) generateBitfieldMsg() []byte {
+	buf := make([]byte, len(mngr.Bitfield)+5)
+	binary.BigEndian.PutUint32(buf, uint32(len(mngr.Bitfield)+1))
+	buf[4] = byte(Bitfield)
+	copy(buf[5:], mngr.Bitfield)
+	return buf
+}
+
+func (mngr *PeerManager) generatePieceMsg(idx uint32, offset uint32, data []byte) []byte {
+	buf := make([]byte, len(data)+13)
+	binary.BigEndian.PutUint32(buf, uint32(len(data)+9))
+	buf[4] = byte(Piece)
+	copy(buf[5:], data)
+	return buf
 }
 
 func (mngr *PeerManager) getWantedPieces(p *Peer) BitfieldMask {
