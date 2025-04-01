@@ -48,6 +48,7 @@ type Block struct {
 	Index  uint32
 	Offset uint32
 	Data   []byte
+	Status BlockStatus
 }
 
 type Piece struct {
@@ -79,6 +80,7 @@ func (mngr *PieceManager) Run() {
 		select {
 		case newBlock := <-mngr.PeerManagerRecvCh:
 			go mngr.setBlock(&newBlock)
+			continue
 		case <-time.After(15 * time.Second):
 			continue
 		}
