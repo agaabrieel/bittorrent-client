@@ -58,10 +58,8 @@ func NewTorrentSession(filepath string) (*TorrentSession, error) {
 
 }
 
-func (t *TorrentSession) MainLoop() {
-	
+func (t *TorrentSession) Init() {
+
 	responseCh := make(chan tracker.AnnounceResponse, 10)
 	errCh := make(chan error, 10)
-
-	for
 }
