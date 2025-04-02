@@ -9,14 +9,18 @@ func (bf BitfieldMask) HasPiece(idx uint32) bool {
 	return bf[byteIdx]>>bitIdx == 0b1
 }
 
-func (bf BitfieldMask) SetPiece(idx uint32) {
-	byteIdx := (len(bf) / 8)
-	bitIdx := (len(bf) % 8)
-	bf[byteIdx] = bf[byteIdx] | (1 << bitIdx)
+func (bf *BitfieldMask) SetPiece(idx uint32) {
+	byteIdx := (len(*bf) / 8)
+	bitIdx := (len(*bf) % 8)
+	(*bf)[byteIdx] = (*bf)[byteIdx] | (1 << bitIdx)
 }
 
-func (bf BitfieldMask) Zero() {
-	for i := range bf {
-		bf[i] = byte(0x00)
+func (bf *BitfieldMask) ZeroBitfield() {
+	for i := range *bf {
+		(*bf)[i] = byte(0x00)
 	}
+}
+
+func (bf *BitfieldMask) ZeroPiece(idx uint32) {
+	(*bf)[idx] = byte(0x00)
 }
