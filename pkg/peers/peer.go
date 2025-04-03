@@ -302,8 +302,7 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 	Handshake.Write(id[:])
 
 	if Handshake.Len() != 68 {
-		err = fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len())
-		return err
+		return fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len())
 	}
 
 	// Sets write deadline
@@ -314,10 +313,15 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 	}
 
 	// Writes handshake message
-	_, err = conn.Write(Handshake.Bytes())
-	if err != nil {
-		return fmt.Errorf("failed to write to peer: %w", err)
+	writtenBytes := 0
+	for writtenBytes < Handshake.Len() {
+		n, err := conn.Write(Handshake.Bytes()[writtenBytes:])
+		if err != nil {
+			return fmt.Errorf("failed to write to peer: %w", err)
+		}
+		writtenBytes += n
 	}
+
 	// Sets read deadline
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetReadDeadline(deadline)
@@ -325,10 +329,15 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 		conn.SetReadDeadline(time.Now().Add(time.Second * 30))
 	}
 
-	// zeroes buffer and reads handshake response
+	// reads handshake response
 	responseBuffer := make([]byte, 68)
-	if _, err := io.ReadFull(conn, responseBuffer); err != nil {
-		return fmt.Errorf("couldn't read handshake: %w", err)
+	readBytes := 0
+	for readBytes < len(responseBuffer) {
+		n, err := conn.Read(responseBuffer[readBytes:])
+		if err != nil {
+			return fmt.Errorf("failed to write to peer: %w", err)
+		}
+		readBytes += n
 	}
 
 	if !bytes.Equal(responseBuffer[0:28], Handshake.Bytes()[:28]) {
