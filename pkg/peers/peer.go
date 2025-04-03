@@ -365,6 +365,9 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 
 func readLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, recvCh chan<- PeerMessage) {
 
+	timer := time.NewTimer(120 * time.Second)
+	defer timer.Stop()
+
 	defer wg.Done()
 
 	if ctx == nil {
@@ -377,12 +380,16 @@ func readLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, recvCh chan<- Pe
 	)
 
 	for {
+		timer.Reset(120 * time.Second)
 		select {
 		case <-ctx.Done():
 			return
 
+		case <-timer.C:
+			return
+
 		default:
-			p.Conn.SetReadDeadline(time.Now().Add(time.Second * 15))
+			p.Conn.SetReadDeadline(time.Now().Add(time.Second * 30))
 
 			n, err := p.Conn.Read(buf)
 			if err != nil {
@@ -432,6 +439,8 @@ func readLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, recvCh chan<- Pe
 
 func writeLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, sendCh <-chan []byte) {
 
+	timer := time.NewTimer(120 * time.Second)
+	defer timer.Stop()
 	defer wg.Done()
 
 	if ctx == nil {
@@ -439,8 +448,11 @@ func writeLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, sendCh <-chan [
 	}
 
 	for {
+		timer.Reset(120 * time.Second)
 		select {
 		case <-ctx.Done():
+			return
+		case <-timer.C:
 			return
 		case msg := <-sendCh:
 
