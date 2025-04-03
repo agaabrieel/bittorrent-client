@@ -16,23 +16,26 @@ import (
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
-	piece "github.com/agaabrieel/bittorrent-client/pkg/piece"
+	"github.com/agaabrieel/bittorrent-client/pkg/piece"
 )
+
+const PEER_WORKERS = 10
 
 type PeerMessageType uint8
 
 const (
-	Choke         PeerMessageType = 0x00
-	Unchoke       PeerMessageType = 0x01
-	Interested    PeerMessageType = 0x02
-	NotInterested PeerMessageType = 0x03
-	Have          PeerMessageType = 0x04
-	Bitfield      PeerMessageType = 0x05
-	Request       PeerMessageType = 0x06
-	Piece         PeerMessageType = 0x07
-	Cancel        PeerMessageType = 0x08
-	Port          PeerMessageType = 0x09 // DHT
-	KeepAlive     PeerMessageType = 0x10 // NOT PROTOCOL-COMPLIANT
+	Choke PeerMessageType = iota
+	Unchoke
+	Interested
+	NotInterested
+	Have
+	Bitfield
+	Request
+	Piece
+	Cancel
+	Port              // DHT
+	KeepAlive         // NOT PROTOCOL-COMPLIANT
+	HandshakeResponse // NOT PROTOCOL-COMPLIANT
 )
 
 type PeerMessage struct {
@@ -41,17 +44,19 @@ type PeerMessage struct {
 }
 
 type Peer struct {
-	Id            [20]byte
-	Ip            net.IP
-	Port          uint16
-	Conn          net.Conn
-	Bitfield      bitfield.BitfieldMask
-	IsInterested  bool
-	IsInteresting bool
-	IsChoked      bool
-	IsChoking     bool
-	LastActive    time.Time
-	LastMessage   PeerMessage
+	Id              [20]byte
+	Ip              net.IP
+	Port            uint16
+	Conn            net.Conn
+	Bitfield        bitfield.BitfieldMask
+	IsInterested    bool
+	IsInteresting   bool
+	IsChoked        bool
+	IsChoking       bool
+	PiecesRequested []PeerMessage
+	LastActive      time.Time
+	LastMessage     PeerMessage
+	mu              *sync.RWMutex
 }
 
 type PeerManager struct {
@@ -62,7 +67,7 @@ type PeerManager struct {
 	PieceManagerSendCh   chan<- messaging.PeerToPieceManagerMsg
 	ErrorCh              chan error
 	Metainfo             *metainfo.TorrentMetainfo
-	mutex                *sync.Mutex
+	mutex                *sync.RWMutex
 	waitgroup            *sync.WaitGroup
 }
 
@@ -80,7 +85,7 @@ func NewPeerManager(peers []Peer, bitfield bitfield.BitfieldMask, trackerCh <-ch
 		PieceManagerSendCh:   sendCh,
 		TrackerManagerRecvCh: trackerCh,
 		ErrorCh:              errCh,
-		mutex:                &sync.Mutex{},
+		mutex:                &sync.RWMutex{},
 		waitgroup:            &sync.WaitGroup{},
 	}
 	return &mngr
@@ -106,6 +111,7 @@ func (mngr *PeerManager) Run(ctx context.Context) {
 
 func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 
+	timer := time.NewTimer(500 * time.Millisecond)
 	defer mngr.waitgroup.Done()
 	defer p.Conn.Close()
 
@@ -135,91 +141,56 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
+
 		case msg := <-recvCh:
 			p.LastMessage = msg
+			p.LastActive = time.Now()
 			switch msg.messageType {
 
+			// First 6 cases simply update the internal peer status
 			case Choke:
-
 				p.IsChoking = true
-				break
 
 			case Unchoke:
-
 				p.IsChoking = false
-				wantedPieces := mngr.getWantedPieces(p)
-				idx := findFirstNonZeroBit(wantedPieces)
-				var resp []byte
-
-				if idx != -1 {
-					resp = mngr.generateRequestMsg()
-					sendCh <- resp
-				}
-				break
 
 			case NotInterested:
-
 				p.IsInterested = false
-				break
 
 			case Interested:
-
-				var resp []byte
 				p.IsInterested = true
-				if p.IsChoked {
-					resp = mngr.generateNoPayloadMsg(Unchoke)
-					sendCh <- resp
-				}
-				break
 
 			case Bitfield:
-
 				p.Bitfield = msg.data
 				wantedPieces := mngr.getWantedPieces(p)
-				idx := findFirstNonZeroBit(wantedPieces)
-				var resp []byte
 
-				if idx != -1 {
-					if p.IsChoking {
-						resp = mngr.generateNoPayloadMsg(Interested)
-					} else {
-						resp = mngr.generateRequestMsg()
+				if wantedPieces {
+					if !p.IsInteresting {
+						sendCh <- mngr.generateNoPayloadMsg(Interested)
+						p.IsInteresting = true
 					}
-				} else {
-					resp = mngr.generateNoPayloadMsg(NotInterested)
+				} else if p.IsInteresting {
+					sendCh <- mngr.generateNoPayloadMsg(NotInterested)
+					p.IsInteresting = false
 				}
-				sendCh <- resp
-				break
 
 			case Have:
+				p.Bitfield.SetPiece(binary.BigEndian.Uint32(msg.data[5:]))
+				wantedPieces := mngr.getWantedPieces(p)
 
-				pieceIdx := binary.BigEndian.Uint32(msg.data[5:])
-				p.Bitfield.SetPiece(pieceIdx)
-
-				mngr.mutex.Lock()
-				if !mngr.Bitfield.HasPiece(pieceIdx) {
-					mngr.mutex.Unlock()
-
+				if wantedPieces {
 					if !p.IsInteresting {
-						p.IsInteresting = true
 						sendCh <- mngr.generateNoPayloadMsg(Interested)
+						p.IsInteresting = true
 					}
-
-					if p.IsChoked {
-						sendCh <- mngr.generateNoPayloadMsg(Unchoke)
-					}
-
-					if !p.IsChoking {
-						sendCh <- mngr.generateRequestMsg()
-					}
-
 				} else if p.IsInteresting {
-					p.IsInteresting = false
 					sendCh <- mngr.generateNoPayloadMsg(NotInterested)
+					p.IsInteresting = false
 				}
 
-				break
-
+			// Most actions will happen as responses to these 2 message types, as the default case or after the timer
 			case Request:
 
 				if p.IsChoked {
@@ -246,8 +217,6 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 					sendCh <- reply.Data
 				}
 
-				break
-
 			case Piece:
 
 				msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1) // -1 to account for message ID
@@ -270,11 +239,12 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 					mngr.Bitfield.ZeroPiece(pieceIdx)
 				}
 				mngr.mutex.Unlock()
-				break
 			}
-		case <-time.After(time.Second * 120):
-		case <-ctx.Done():
-			return
+
+		case <-timer.C:
+			if p.IsInteresting && !p.IsChoking {
+				sendCh <- mngr.generateRequestMsg()
+			}
 		}
 	}
 }
@@ -358,7 +328,12 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 	p.IsInterested = false
 	p.IsChoking = true
 	p.IsInteresting = false
+	p.LastActive = time.Now()
 	p.Conn = conn
+	p.LastMessage = PeerMessage{
+		messageType: HandshakeResponse,
+		data:        nil,
+	}
 
 	return nil
 }
