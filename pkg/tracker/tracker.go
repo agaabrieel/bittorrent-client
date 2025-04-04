@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"
 	peer "github.com/agaabrieel/bittorrent-client/pkg/peers"
 )
@@ -29,54 +30,76 @@ const (
 	ErrorAction
 )
 
-type Client interface {
+type client interface {
 	Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error)
 }
 
 type HTTPClient struct {
-	Client *http.Client
+	client *http.Client
 }
 
 type UDPClient struct {
-	Dialer  *net.Dialer
+	dialer  *net.Dialer
 	connIds map[string]uint64
 	mutex   sync.Mutex
 }
 
 type AnnounceRequest struct {
-	InfoHash   [20]byte
-	PeerID     [20]byte
-	Port       uint16
-	Uploaded   uint64
-	Downloaded uint64
-	Left       uint64
-	Event      string // "started", "stopped", "completed"
+	infoHash   [20]byte
+	peerID     [20]byte
+	port       uint16
+	uploaded   uint64
+	downloaded uint64
+	left       uint64
+	event      string // "started", "stopped", "completed"
 }
 
 type AnnounceResponse struct {
-	Interval time.Duration // Seconds to wait between announces
-	Peers    []peer.Peer   // List of peers
+	interval time.Duration // Seconds to wait between announces
+	peers    []peer.Peer   // List of peers
 	// ... other fields
 }
 
 type Tracker struct {
-	Client
-	Url      url.URL
-	Interval time.Duration
+	client
+	url      url.URL
+	interval time.Duration
+}
+
+type TrackerManager struct {
+	trackers  []Tracker
+	sendCh    chan<- messaging.ChannelMessage
+	recvCh    <-chan messaging.ChannelMessage
+	waitGroup sync.WaitGroup
+	mu        sync.Mutex
+}
+
+func NewTrackerManager(sendCh chan<- messaging.ChannelMessage, recvCh <-chan messaging.ChannelMessage) *TrackerManager {
+	return &TrackerManager{
+		trackers:  make([]Tracker, 0),
+		sendCh:    sendCh,
+		recvCh:    recvCh,
+		waitGroup: sync.WaitGroup{},
+		mu:        sync.Mutex{},
+	}
+}
+
+func (mngr *TrackerManager) Run() {
+
 }
 
 func NewTracker(trackerUrl url.URL) Tracker {
 
-	var tc Client
+	var tc client
 	if trackerUrl.Scheme == "udp" {
 		tc = &UDPClient{
-			Dialer: &net.Dialer{
+			dialer: &net.Dialer{
 				Timeout: time.Duration(time.Second * 45),
 			},
 		}
 	} else if trackerUrl.Scheme == "http" || trackerUrl.Scheme == "https" {
 		tc = &HTTPClient{
-			Client: &http.Client{
+			client: &http.Client{
 				Timeout: time.Duration(time.Second * 45),
 			},
 		}
@@ -85,9 +108,9 @@ func NewTracker(trackerUrl url.URL) Tracker {
 	}
 
 	return Tracker{
-		Client:   tc,
-		Url:      trackerUrl,
-		Interval: time.Duration(0),
+		client:   tc,
+		url:      trackerUrl,
+		interval: time.Duration(0),
 	}
 }
 
@@ -95,21 +118,20 @@ func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req Announce
 
 	defer wg.Done()
 
-	if t.Client == nil {
+	if t.client == nil {
 		errCh <- errors.New("tracker does not implement client")
 		return
 	}
 
-	resp, err := t.Client.Announce(ctx, t.Url, req)
+	resp, err := t.client.Announce(ctx, t.url, req)
 	if err != nil {
 		errCh <- fmt.Errorf("failed tracker announce: %w", err)
 	}
 
-	if resp.Interval > 0 {
-		t.Interval = resp.Interval
+	if resp.interval > 0 {
+		t.interval = resp.interval
 	} else {
-		t.Interval = time.Second * 30
-		errCh <- errors.New("tracker gave 0 interval, resorting to default 30 seconds")
+		t.interval = time.Second * 30
 	}
 	respCh <- resp
 }
@@ -118,7 +140,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 
 	var announceResp AnnounceResponse
 
-	if c.Dialer == nil {
+	if c.dialer == nil {
 		return AnnounceResponse{}, fmt.Errorf("client has no valid dialer")
 	}
 
@@ -127,7 +149,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 		return AnnounceResponse{}, fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
 
-	conn, err := c.Dialer.DialContext(ctx, "udp", serverAddr.String())
+	conn, err := c.dialer.DialContext(ctx, "udp", serverAddr.String())
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to connect to tracker: %w", err)
 	}
@@ -175,27 +197,27 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 
 func (c *HTTPClient) Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error) {
 
-	if c.Client == nil {
+	if c.client == nil {
 		return AnnounceResponse{}, errors.New("tracker client is nil")
 	}
 
 	params := url.Values{}
-	params.Set("info_hash", string(req.InfoHash[:]))
-	params.Set("peer_id", string(req.PeerID[:]))
-	params.Set("port", strconv.Itoa(int(req.Port)))
+	params.Set("info_hash", string(req.infoHash[:]))
+	params.Set("peer_id", string(req.peerID[:]))
+	params.Set("port", strconv.Itoa(int(req.port)))
 
-	uploaded := strconv.Itoa(int(req.Uploaded))
+	uploaded := strconv.Itoa(int(req.uploaded))
 	params.Set("uploaded", uploaded)
 
-	dowloaded := strconv.Itoa(int(req.Downloaded))
+	dowloaded := strconv.Itoa(int(req.downloaded))
 	params.Set("downloaded", dowloaded)
 
-	left := strconv.Itoa(int(req.Left))
+	left := strconv.Itoa(int(req.left))
 	params.Set("left", left)
 
 	params.Set("compact", string("1"))
-	if req.Event != "" {
-		params.Set("event", req.Event)
+	if req.event != "" {
+		params.Set("event", req.event)
 	}
 
 	finalUrl := trackerUrl
@@ -206,7 +228,7 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerUrl url.URL, req Annou
 		return AnnounceResponse{}, fmt.Errorf("failed to create request context: %w", err)
 	}
 
-	resp, err := c.Client.Do(httpReq)
+	resp, err := c.client.Do(httpReq)
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to make tracker requerst: %w", err)
 	}
@@ -311,14 +333,14 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 	}
 
 	var announceResp AnnounceResponse
-	announceResp.Peers = make([]peer.Peer, 0, numPeers)
-	announceResp.Interval = time.Duration(binary.BigEndian.Uint32(announceBuffer[8:12])) * time.Second
+	announceResp.peers = make([]peer.Peer, 0, numPeers)
+	announceResp.interval = time.Duration(binary.BigEndian.Uint32(announceBuffer[8:12])) * time.Second
 
 	for i := range numPeers {
 		offset := i * 6
 		ip := net.IP(peerData[offset : offset+4])
 		port := binary.BigEndian.Uint16(peerData[offset+4 : offset+6])
-		announceResp.Peers = append(announceResp.Peers, peer.Peer{
+		announceResp.peers = append(announceResp.peers, peer.Peer{
 			Ip:   ip,
 			Port: port,
 		})
@@ -400,15 +422,15 @@ func (c *UDPClient) generateAnnounceMsg(transactionId uint32, req AnnounceReques
 	binary.BigEndian.PutUint32(announceMsg[8:12], uint32(AnnounceAction))
 
 	binary.BigEndian.PutUint32(announceMsg[12:16], transactionId)
-	copy(announceMsg[16:36], req.InfoHash[:])
-	copy(announceMsg[36:56], req.PeerID[:])
+	copy(announceMsg[16:36], req.infoHash[:])
+	copy(announceMsg[36:56], req.peerID[:])
 
-	binary.BigEndian.PutUint64(announceMsg[56:64], req.Downloaded)
-	binary.BigEndian.PutUint64(announceMsg[64:72], req.Left)
-	binary.BigEndian.PutUint64(announceMsg[72:80], req.Uploaded)
+	binary.BigEndian.PutUint64(announceMsg[56:64], req.downloaded)
+	binary.BigEndian.PutUint64(announceMsg[64:72], req.left)
+	binary.BigEndian.PutUint64(announceMsg[72:80], req.uploaded)
 
 	var eventCode uint32 = 0 // Default: none
-	switch req.Event {
+	switch req.event {
 	case "completed":
 		eventCode = 1
 	case "started":
@@ -422,7 +444,7 @@ func (c *UDPClient) generateAnnounceMsg(transactionId uint32, req AnnounceReques
 	binary.BigEndian.PutUint32(announceMsg[84:88], 0)
 	binary.BigEndian.PutUint32(announceMsg[88:92], 0)
 	binary.BigEndian.PutUint32(announceMsg[92:96], 0xFFFFFFFF) // -1 as an uint32
-	binary.BigEndian.PutUint16(announceMsg[96:98], req.Port)
+	binary.BigEndian.PutUint16(announceMsg[96:98], req.port)
 
 	return announceMsg
 }
@@ -450,7 +472,7 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 
 		case "interval":
 
-			resp.Interval = time.Duration(entry.Value.IntegerValue)
+			resp.interval = time.Duration(entry.Value.IntegerValue)
 			continue
 
 		case "peers":
@@ -468,7 +490,7 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 					ip := net.ParseIP(string(entry.Value.StringValue[i : i+4]))
 					port := binary.BigEndian.Uint16(entry.Value.StringValue[i+4 : i+6])
 
-					resp.Peers = append(resp.Peers, peer.Peer{
+					resp.peers = append(resp.peers, peer.Peer{
 						Ip:   ip,
 						Port: port,
 					})
@@ -497,7 +519,7 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 							continue
 						}
 					}
-					resp.Peers = append(resp.Peers, peer)
+					resp.peers = append(resp.peers, peer)
 
 				}
 			}

@@ -92,7 +92,7 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 	defer mngr.mutex.Unlock()
 
 	var blockIndex int
-	var bitIndex int
+	// var bitIndex int
 	var bitfieldByte byte
 	for {
 		blockIndex = rand.Intn(BLOCK_BITFIELD_SIZE)

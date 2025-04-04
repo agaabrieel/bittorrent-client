@@ -16,7 +16,7 @@ import (
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
-	"github.com/agaabrieel/bittorrent-client/pkg/piece"
+	piece "github.com/agaabrieel/bittorrent-client/pkg/piece"
 )
 
 const PEER_WORKERS = 10
@@ -60,15 +60,17 @@ type Peer struct {
 }
 
 type PeerManager struct {
-	id                   [20]byte
-	Bitfield             bitfield.BitfieldMask
-	Peers                []Peer
-	TrackerManagerRecvCh <-chan []Peer
-	PieceManagerSendCh   chan<- messaging.PeerToPieceManagerMsg
-	ErrorCh              chan error
-	Metainfo             *metainfo.TorrentMetainfo
-	mutex                *sync.RWMutex
-	waitgroup            *sync.WaitGroup
+	id                 [20]byte
+	AskedBlocks        []piece.Block
+	Bitfield           bitfield.BitfieldMask
+	Peers              []Peer
+	Metainfo           *metainfo.TorrentMetainfo
+	mutex              *sync.RWMutex
+	waitgroup          *sync.WaitGroup
+	SessionSendCh      chan messaging.ChannelMessage
+	SessionRecvCh      chan messaging.ChannelMessage
+	PieceManagerSendCh chan<- messaging.PeerToPieceManagerMsg
+	ErrorCh            chan error
 }
 
 func NewPeerManager(peers []Peer, bitfield bitfield.BitfieldMask, trackerCh <-chan []Peer, errCh chan error, sendCh chan<- messaging.PeerToPieceManagerMsg, metainfo *metainfo.TorrentMetainfo) *PeerManager {
@@ -111,7 +113,6 @@ func (mngr *PeerManager) Run(ctx context.Context) {
 
 func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 
-	timer := time.NewTimer(500 * time.Millisecond)
 	defer mngr.waitgroup.Done()
 	defer p.Conn.Close()
 
@@ -135,9 +136,19 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 	recvCh := make(chan PeerMessage, 1024)
 	sendCh := make(chan []byte, 1024)
 
-	mngr.waitgroup.Add(2)
-	go writeLoop(mngr.waitgroup, p, ctx, sendCh)
-	go readLoop(mngr.waitgroup, p, ctx, recvCh)
+	// Writer loop
+	mngr.waitgroup.Add(1)
+	go func() {
+		defer mngr.waitgroup.Done()
+		go writeLoop(p, ctx, sendCh)
+	}()
+
+	// Reader loop
+	mngr.waitgroup.Add(1)
+	go func() {
+		defer mngr.waitgroup.Done()
+		go readLoop(p, ctx, recvCh)
+	}()
 
 	for {
 		select {
@@ -166,7 +177,7 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 				p.Bitfield = msg.data
 				wantedPieces := mngr.getWantedPieces(p)
 
-				if wantedPieces {
+				if wantedPieces != nil {
 					if !p.IsInteresting {
 						sendCh <- mngr.generateNoPayloadMsg(Interested)
 						p.IsInteresting = true
@@ -180,7 +191,7 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 				p.Bitfield.SetPiece(binary.BigEndian.Uint32(msg.data[5:]))
 				wantedPieces := mngr.getWantedPieces(p)
 
-				if wantedPieces {
+				if wantedPieces != nil {
 					if !p.IsInteresting {
 						sendCh <- mngr.generateNoPayloadMsg(Interested)
 						p.IsInteresting = true
@@ -241,7 +252,7 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context) {
 				mngr.mutex.Unlock()
 			}
 
-		case <-timer.C:
+		default:
 			if p.IsInteresting && !p.IsChoking {
 				sendCh <- mngr.generateRequestMsg()
 			}
@@ -338,12 +349,10 @@ func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, 
 	return nil
 }
 
-func readLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, recvCh chan<- PeerMessage) {
+func readLoop(p *Peer, ctx context.Context, recvCh chan<- PeerMessage) {
 
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
-
-	defer wg.Done()
 
 	if ctx == nil {
 		ctx = context.Background()
@@ -412,11 +421,10 @@ func readLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, recvCh chan<- Pe
 	}
 }
 
-func writeLoop(wg *sync.WaitGroup, p *Peer, ctx context.Context, sendCh <-chan []byte) {
+func writeLoop(p *Peer, ctx context.Context, sendCh <-chan []byte) {
 
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
-	defer wg.Done()
 
 	if ctx == nil {
 		ctx = context.Background()

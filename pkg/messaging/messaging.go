@@ -39,3 +39,11 @@ type PieceManagerToPeerMsg struct {
 	MessageType MessageType
 	Data        []byte
 }
+
+//
+
+type ChannelMessage uint8
+
+const (
+	GetBitfield ChannelMessage = iota
+)
