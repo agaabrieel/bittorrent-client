@@ -18,60 +18,60 @@ import (
 	tracker "github.com/agaabrieel/bittorrent-client/pkg/tracker"
 )
 
-type TorrentSession struct {
-	Id              [20]byte
-	Port            int
-	Metainfo        metainfo.TorrentMetainfo
-	TrackerManager  *tracker.TrackerManager
-	PeerManager     *peer.PeerManager
-	PieceManager    *piece.PieceManager
-	ComponentSendCh chan messaging.ChannelMessage
-	ComponentRecvCh chan messaging.ChannelMessage
-	WaitGroup       sync.WaitGroup
-	Mutex           sync.Mutex
+type SessionManager struct {
+	Id        [20]byte
+	Port      int
+	Metainfo  metainfo.TorrentMetainfo
+	RecvCh    <-chan messaging.Message
+	SendCh    chan<- messaging.Message
+	WaitGroup sync.WaitGroup
+	Mutex     sync.Mutex
 }
 
-func NewTorrentSession(filepath string) (*TorrentSession, error) {
+func NewTorrentSession(filepath string) (*SessionManager, error) {
 
 	meta := metainfo.NewMetainfo()
 	if err := meta.Deserialize(filepath); err != nil {
 		return nil, fmt.Errorf("failed to parse torrent file: %w", err)
 	}
 
-	sendCh := make(chan messaging.ChannelMessage)
-	recvCh := make(chan messaging.ChannelMessage)
-
-	trackerManager := tracker.NewTrackerManager(sendCh, recvCh)
-	pieceManager := piece.NewPieceManager()
-	peerManager := peer.NewPeerManager()
-
 	var id [20]byte
 	rand.Read(id[:])
 
-	return &TorrentSession{
-		Id:              id,
-		Port:            6081,
-		TrackerManager:  trackerManager,
-		PieceManager:    pieceManager,
-		PeerManager:     peerManager,
-		ComponentSendCh: sendCh,
-		ComponentRecvCh: recvCh,
-		Mutex:           sync.Mutex{},
-		WaitGroup:       sync.WaitGroup{},
+	return &SessionManager{
+		Id:        id,
+		Port:      6081,
+		SendCh:    make(chan messaging.Message, 256),
+		RecvCh:    make(chan messaging.Message, 256),
+		Mutex:     sync.Mutex{},
+		WaitGroup: sync.WaitGroup{},
 	}, nil
 
 }
 
-func (t *TorrentSession) Init() {
+func (t *SessionManager) Run() {
+
+	Router := messaging.Router{
+		Subscribers: make(map[messaging.MessageType][]chan<- messaging.Message),
+	}
+
+	globalCh := make(chan messaging.Message)
+
+	TrackerManager := tracker.NewTrackerManager(t.Metainfo.InfoDict, &Router, globalCh)
+
+	PieceManager := piece.NewPieceManager(t.Metainfo.InfoDict, &Router, globalCh)
+
+	PeerManager := peer.NewPeerManager(t.Metainfo.InfoDict, &Router, globalCh)
 
 	ctx := context.Background()
 
-	t.WaitGroup.Add(3)
+	t.WaitGroup.Add(4)
 	defer t.WaitGroup.Wait()
 
-	go t.TrackerManager.Run()
-	go t.PeerManager.Run()
-	go t.PieceManager.Run()
+	go Router.Start(globalCh)
+	go TrackerManager.Run(ctx, &t.WaitGroup)
+	go PeerManager.Run(ctx, &t.WaitGroup)
+	go PieceManager.Run(ctx, &t.WaitGroup)
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(t.Port)))
 	if err != nil {
@@ -99,7 +99,6 @@ func (t *TorrentSession) Init() {
 				}
 
 				t.WaitGroup.Add(1)
-				go performHandshake(ctx, conn, &t.WaitGroup, t.ComponentSendCh, t.Metainfo.Infohash, t.Id)
 
 			}
 		}

@@ -2,6 +2,10 @@ package bitfield
 
 type BitfieldMask []byte
 
+func NewBitfield(size uint32) BitfieldMask {
+	return make(BitfieldMask, size)
+}
+
 func (bf BitfieldMask) HasPiece(idx uint32) bool {
 	// suppose len(bf) == 14
 	byteIdx := (len(bf) / 8) // = 1, since 1*8 = 8 and 2*8 = 16

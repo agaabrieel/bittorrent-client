@@ -1,12 +1,13 @@
 package piece
 
 import (
+	"context"
 	"crypto/sha1"
 	"encoding/binary"
+	"math"
 	"math/bits"
 	"math/rand"
 	"sync"
-	"time"
 
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
@@ -17,10 +18,12 @@ const BLOCK_SIZE = 16384                   // 16KB
 const BLOCK_BITFIELD_SIZE = BLOCK_SIZE / 8 // 2048
 
 type PieceManager struct {
-	Metainfo          *metainfo.TorrentMetainfoInfoDict
-	Pieces            []Piece
-	PeerManagerRecvCh <-chan messaging.PeerToPieceManagerMsg
-	mutex             *sync.Mutex
+	Metainfo *metainfo.TorrentMetainfoInfoDict
+	Pieces   []Piece
+	SendCh   chan<- messaging.Message
+	RecvCh   <-chan messaging.Message
+	ErrCh    chan<- error
+	Mutex    *sync.Mutex
 }
 
 type BlockStatus uint8
@@ -43,41 +46,33 @@ type Piece struct {
 	Blocks        []Block
 }
 
-func NewPieceManager(metainfo *metainfo.TorrentMetainfo, recvCh <-chan messaging.PeerToPieceManagerMsg) *PieceManager {
+func NewPieceManager(meta *metainfo.TorrentMetainfoInfoDict, r *messaging.Router, globalCh chan messaging.Message) *PieceManager {
 
-	fileLen := metainfo.InfoDict.Length
-	pieceLen := metainfo.InfoDict.PieceLength
-	// _16kb := 16383
+	recvCh := make(chan messaging.Message, 256)
 
-	piecesNum := fileLen / pieceLen
-	if fileLen%pieceLen != 0 {
-		piecesNum++
-	}
-
-	piecesArr := make([]Piece, piecesNum)
-	for _, piece := range piecesArr {
-		piece.BlockBitfield = make(bitfield.BitfieldMask, BLOCK_BITFIELD_SIZE)
-		piece.Blocks = make([]Block, metainfo.InfoDict.PieceLength/BLOCK_SIZE)
-	}
+	r.Subscribe(messaging.BlockRequest, recvCh)
+	r.Subscribe(messaging.AnnounceDataRequest, recvCh)
 
 	return &PieceManager{
-		Metainfo:          metainfo.InfoDict,
-		Pieces:            piecesArr,
-		PeerManagerRecvCh: recvCh,
+		Metainfo: meta,
+		Pieces:   make([]Piece, int(math.Ceil(float64(meta.Length)/float64(meta.PieceLength)))),
+		SendCh:   globalCh,
+		RecvCh:   recvCh,
+		ErrCh:    make(chan error),
 	}
 }
 
-func (mngr *PieceManager) Run() {
+func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
-		case peerMsg := <-mngr.PeerManagerRecvCh:
+		case peerMsg := <-mngr.RecvCh:
 			switch peerMsg.MessageType {
 			case messaging.BlockRequest:
 				go mngr.getBlock(peerMsg.ReplyCh, peerMsg.Data)
 			case messaging.BlockSend:
 				go mngr.setBlock(peerMsg.ReplyCh, peerMsg.Data)
 			}
-		case <-time.After(15 * time.Second):
+		case <-ctx.Done():
 			continue
 		}
 	}
@@ -88,11 +83,11 @@ func (mngr *PieceManager) pickNextPiece() {
 }
 
 func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
-	mngr.mutex.Lock()
-	defer mngr.mutex.Unlock()
+	mngr.Mutex.Lock()
+	defer mngr.Mutex.Unlock()
 
 	var blockIndex int
-	// var bitIndex int
+	var bitIndex int
 	var bitfieldByte byte
 	for {
 		blockIndex = rand.Intn(BLOCK_BITFIELD_SIZE)
@@ -110,8 +105,8 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 
 func (mngr *PieceManager) getBlock(replyCh chan<- messaging.PieceManagerToPeerMsg, msgData []byte) {
 
-	mngr.mutex.Lock()
-	defer mngr.mutex.Unlock()
+	mngr.Mutex.Lock()
+	defer mngr.Mutex.Unlock()
 
 	pieceIndex := binary.BigEndian.Uint32(msgData[0:4])
 	blockOffset := binary.BigEndian.Uint32(msgData[4:8])

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
+	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"
 	peer "github.com/agaabrieel/bittorrent-client/pkg/peers"
 )
@@ -67,24 +68,34 @@ type Tracker struct {
 }
 
 type TrackerManager struct {
-	trackers  []Tracker
-	sendCh    chan<- messaging.ChannelMessage
-	recvCh    <-chan messaging.ChannelMessage
-	waitGroup sync.WaitGroup
-	mu        sync.Mutex
+	Trackers  []Tracker
+	SendCh    chan<- messaging.Message
+	RecvCh    <-chan messaging.Message
+	ErrCh     chan<- error
+	WaitGroup sync.WaitGroup
+	Mu        sync.Mutex
 }
 
-func NewTrackerManager(sendCh chan<- messaging.ChannelMessage, recvCh <-chan messaging.ChannelMessage) *TrackerManager {
+func NewTrackerManager(meta *metainfo.TorrentMetainfoInfoDict, r *messaging.Router, globalCh chan messaging.Message) *TrackerManager {
+
+	recvCh := make(chan messaging.Message, 256)
+
+	r.Subscribe(messaging.AnnounceDataResponse, recvCh)
+	r.Subscribe(messaging.PieceInvalidated, recvCh)
+	r.Subscribe(messaging.PieceValidated, recvCh)
+	r.Subscribe(messaging.FileFinished, recvCh)
+
 	return &TrackerManager{
-		trackers:  make([]Tracker, 0),
-		sendCh:    sendCh,
-		recvCh:    recvCh,
-		waitGroup: sync.WaitGroup{},
-		mu:        sync.Mutex{},
+		Trackers:  make([]Tracker, 0),
+		SendCh:    recvCh,
+		RecvCh:    globalCh,
+		WaitGroup: sync.WaitGroup{},
+		Mu:        sync.Mutex{},
+		ErrCh:     make(chan error),
 	}
 }
 
-func (mngr *TrackerManager) Run() {
+func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 }
 
