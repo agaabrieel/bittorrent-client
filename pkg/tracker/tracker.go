@@ -245,14 +245,12 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					infoHash:   mngr.Metainfo.Infohash,
 					peerID:     mngr.ClientId,
 					port:       uint16(port),
-					uploaded:   payload.Uploaded,   // READ FROM MSG
-					downloaded: payload.Downloaded, // READ FROM MSG
+					uploaded:   payload.Uploaded,
+					downloaded: payload.Downloaded,
 					left:       payload.Left,
 					event:      payload.Event,
 				}
-
 				go mngr.Tracker.Announce(&mngr.WaitGroup, ctx, req, mngr.AnnounceResponseCh, mngr.ErrCh)
-
 			}
 
 		case msg := <-mngr.AnnounceResponseCh:

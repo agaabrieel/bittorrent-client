@@ -57,6 +57,7 @@ func (r *Router) Start(commCh chan Message) {
 type BlockRequestData struct {
 	Index  uint32
 	Offset uint32
+	Size   uint32
 }
 
 type BlockSendData struct {
@@ -76,5 +77,5 @@ type AnnounceDataResponseData struct {
 	Event      string
 }
 
-type FileFinishedData struct {
+type PeerSendData struct {
 }

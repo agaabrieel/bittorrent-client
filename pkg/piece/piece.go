@@ -3,7 +3,7 @@ package piece
 import (
 	"context"
 	"crypto/sha1"
-	"encoding/binary"
+	"errors"
 	"math"
 	"math/bits"
 	"math/rand"
@@ -46,7 +46,7 @@ type Piece struct {
 	Blocks        []Block
 }
 
-func NewPieceManager(meta *metainfo.TorrentMetainfoInfoDict, r *messaging.Router, globalCh chan messaging.Message) *PieceManager {
+func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message) *PieceManager {
 
 	recvCh := make(chan messaging.Message, 256)
 
@@ -54,8 +54,8 @@ func NewPieceManager(meta *metainfo.TorrentMetainfoInfoDict, r *messaging.Router
 	r.Subscribe(messaging.AnnounceDataRequest, recvCh)
 
 	return &PieceManager{
-		Metainfo: meta,
-		Pieces:   make([]Piece, int(math.Ceil(float64(meta.Length)/float64(meta.PieceLength)))),
+		Metainfo: meta.InfoDict,
+		Pieces:   make([]Piece, int(math.Ceil(float64(meta.InfoDict.Length)/float64(meta.InfoDict.PieceLength)))),
 		SendCh:   globalCh,
 		RecvCh:   recvCh,
 		ErrCh:    make(chan error),
@@ -63,14 +63,32 @@ func NewPieceManager(meta *metainfo.TorrentMetainfoInfoDict, r *messaging.Router
 }
 
 func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
+
+	defer wg.Wait()
+
 	for {
 		select {
-		case peerMsg := <-mngr.RecvCh:
-			switch peerMsg.MessageType {
+		case msg := <-mngr.RecvCh:
+			switch msg.MessageType {
 			case messaging.BlockRequest:
-				go mngr.getBlock(peerMsg.ReplyCh, peerMsg.Data)
+
+				payload, ok := msg.Data.(messaging.BlockRequestData)
+				if !ok {
+					mngr.ErrCh <- errors.New("incorrect payload type")
+					return
+				}
+
+				go mngr.getBlock(payload)
+
 			case messaging.BlockSend:
-				go mngr.setBlock(peerMsg.ReplyCh, peerMsg.Data)
+
+				payload, ok := msg.Data.(messaging.BlockSendData)
+				if !ok {
+					mngr.ErrCh <- errors.New("incorrect payload type")
+					return
+				}
+
+				go mngr.setBlock(payload)
 			}
 		case <-ctx.Done():
 			continue
@@ -98,40 +116,44 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 		}
 
 		bitIndex = bits.Len(uint(bitfieldByte)) - 1
-		// sendCh <- start: pieceLen * pieceIndex, offset: blockSize * (blockIndex + bitIndex)
+		// start: pieceLen * pieceIndex, offset: blockSize * (blockIndex + bitIndex)
+		mngr.SendCh <- messaging.Message{
+			MessageType: messaging.BlockSend,
+			Data:        []byte{byte(mngr.Metainfo.PieceLength), byte(BLOCK_SIZE * (blockIndex + bitIndex))},
+		}
 	}
 
 }
 
-func (mngr *PieceManager) getBlock(replyCh chan<- messaging.PieceManagerToPeerMsg, msgData []byte) {
+func (mngr *PieceManager) getBlock(data messaging.BlockRequestData) {
 
 	mngr.Mutex.Lock()
 	defer mngr.Mutex.Unlock()
 
-	pieceIndex := binary.BigEndian.Uint32(msgData[0:4])
-	blockOffset := binary.BigEndian.Uint32(msgData[4:8])
-	blockSize := binary.BigEndian.Uint32(msgData[8:12])
+	pieceIndex := data.Index
+	blockOffset := data.Offset
+	blockSize := data.Size
 	blockIndex := blockOffset / BLOCK_SIZE
 
 	blockData := make([]byte, blockSize)
 
 	copy(blockData[0:], mngr.Pieces[pieceIndex].Blocks[blockIndex].Data[0:blockSize])
 
-	replyCh <- messaging.PieceManagerToPeerMsg{
+	mngr.SendCh <- messaging.Message{
 		MessageType: messaging.BlockSend,
 		Data:        blockData,
 	}
 
 }
 
-func (mngr *PieceManager) setBlock(replyCh chan<- messaging.PieceManagerToPeerMsg, msgData []byte) {
+func (mngr *PieceManager) setBlock(data messaging.BlockSendData) {
 
-	mngr.mutex.Lock()
-	defer mngr.mutex.Unlock()
+	mngr.Mutex.Lock()
+	defer mngr.Mutex.Unlock()
 
-	pieceIndex := binary.BigEndian.Uint32(msgData[0:4])
-	blockOffset := binary.BigEndian.Uint32(msgData[4:8])
-	blockData := msgData[8:]
+	pieceIndex := data.Index
+	blockOffset := data.Offset
+	blockData := data.Data
 	blockIndex := blockOffset / BLOCK_SIZE
 
 	piece := mngr.Pieces[pieceIndex]
@@ -152,24 +174,7 @@ func (mngr *PieceManager) setBlock(replyCh chan<- messaging.PieceManagerToPeerMs
 	var responseBuffer []byte
 	var responseType messaging.MessageType
 
-	if int(blockOffset)+len(blockData) == int(mngr.Metainfo.PieceLength) {
-
-		responseBuffer = make([]byte, 4)
-		binary.BigEndian.PutUint32(responseBuffer, pieceIndex)
-
-		isPieceValid := mngr.validatePiece(blockData, pieceIndex)
-		if isPieceValid {
-			responseType = messaging.PieceValidated
-		} else {
-			responseType = messaging.PieceInvalidated
-		}
-
-	} else {
-		responseBuffer = nil
-		responseType = messaging.NilMsg
-	}
-
-	replyCh <- messaging.PieceManagerToPeerMsg{
+	mngr.SendCh <- messaging.Message{
 		MessageType: responseType,
 		Data:        responseBuffer,
 	}
@@ -178,8 +183,8 @@ func (mngr *PieceManager) setBlock(replyCh chan<- messaging.PieceManagerToPeerMs
 
 func (mngr *PieceManager) validatePiece(pieceData []byte, pieceIndex uint32) bool {
 
-	mngr.mutex.Lock()
-	defer mngr.mutex.Unlock()
+	mngr.Mutex.Lock()
+	defer mngr.Mutex.Unlock()
 
 	metainfoHash := [20]byte(mngr.Metainfo.Pieces[20*pieceIndex : 20*pieceIndex+20])
 	recvHash := sha1.Sum(pieceData)

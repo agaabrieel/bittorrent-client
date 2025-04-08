@@ -59,11 +59,11 @@ func (t *SessionManager) Run() {
 
 	TrackerManager := tracker.NewTrackerManager(t.Metainfo, t.Id, &Router, globalCh)
 
-	PieceManager := piece.NewPieceManager(t.Metainfo.InfoDict, &Router, globalCh)
+	PieceManager := piece.NewPieceManager(t.Metainfo, &Router, globalCh)
 
-	PeerManager := peer.NewPeerManager(t.Metainfo.InfoDict, &Router, globalCh)
+	PeerManager := peer.NewPeerManager(t.Metainfo, &Router, globalCh)
 
-	ctx := context.Background()
+	ctx, ctxCancel := context.WithCancel(context.Background())
 
 	t.WaitGroup.Add(4)
 	defer t.WaitGroup.Wait()
@@ -85,7 +85,6 @@ func (t *SessionManager) Run() {
 		var conn net.Conn
 		for {
 			select {
-
 			case <-ctx.Done():
 				log.Default().Printf("context sent: %v", ctx.Err())
 				return
@@ -97,9 +96,7 @@ func (t *SessionManager) Run() {
 					conn.Close()
 					continue
 				}
-
 				t.WaitGroup.Add(1)
-
 			}
 		}
 	}()
@@ -108,13 +105,14 @@ func (t *SessionManager) Run() {
 	go func() {
 		for {
 			select {
-
 			case <-ctx.Done():
 				log.Default().Printf("context sent: %v", ctx.Err())
 				return
-
-			case a:
-				// ipipipipi
+			case msg := <-t.RecvCh:
+				switch msg.MessageType {
+				case messaging.FileFinished:
+					ctxCancel()
+				}
 			}
 		}
 	}()
