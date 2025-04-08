@@ -57,7 +57,7 @@ func (t *SessionManager) Run() {
 
 	globalCh := make(chan messaging.Message)
 
-	TrackerManager := tracker.NewTrackerManager(t.Metainfo.InfoDict, &Router, globalCh)
+	TrackerManager := tracker.NewTrackerManager(t.Metainfo, t.Id, &Router, globalCh)
 
 	PieceManager := piece.NewPieceManager(t.Metainfo.InfoDict, &Router, globalCh)
 

@@ -56,6 +56,7 @@ type AnnounceRequest struct {
 }
 
 type AnnounceResponse struct {
+	tracker  *Tracker
 	interval time.Duration // Seconds to wait between announces
 	peers    []peer.Peer   // List of peers
 	// ... other fields
@@ -65,18 +66,25 @@ type Tracker struct {
 	client
 	url      url.URL
 	interval time.Duration
+	peers    []peer.Peer
+	peerMap  map[[20]byte]bool
 }
 
 type TrackerManager struct {
-	Trackers  []Tracker
-	SendCh    chan<- messaging.Message
-	RecvCh    <-chan messaging.Message
-	ErrCh     chan<- error
-	WaitGroup sync.WaitGroup
-	Mu        sync.Mutex
+	Tracker                  *Tracker
+	ClientId                 [20]byte
+	Metainfo                 metainfo.TorrentMetainfo
+	SendCh                   chan<- messaging.Message
+	RecvCh                   <-chan messaging.Message
+	AnnounceResponseCh       chan AnnounceResponse
+	ErrCh                    chan<- error
+	IsWaitingForAnnounceData bool
+	WaitGroup                sync.WaitGroup
+	Mu                       sync.Mutex
+	SubcribedMessageTypes    []messaging.MessageType
 }
 
-func NewTrackerManager(meta *metainfo.TorrentMetainfoInfoDict, r *messaging.Router, globalCh chan messaging.Message) *TrackerManager {
+func NewTrackerManager(meta metainfo.TorrentMetainfo, ourId [20]byte, r *messaging.Router, globalCh chan messaging.Message) *TrackerManager {
 
 	recvCh := make(chan messaging.Message, 256)
 
@@ -86,16 +94,196 @@ func NewTrackerManager(meta *metainfo.TorrentMetainfoInfoDict, r *messaging.Rout
 	r.Subscribe(messaging.FileFinished, recvCh)
 
 	return &TrackerManager{
-		Trackers:  make([]Tracker, 0),
-		SendCh:    recvCh,
-		RecvCh:    globalCh,
-		WaitGroup: sync.WaitGroup{},
-		Mu:        sync.Mutex{},
-		ErrCh:     make(chan error),
+		Tracker:            nil,
+		Metainfo:           meta,
+		ClientId:           ourId,
+		SendCh:             globalCh,
+		RecvCh:             recvCh,
+		AnnounceResponseCh: make(chan AnnounceResponse),
+		WaitGroup:          sync.WaitGroup{},
+		Mu:                 sync.Mutex{},
+		ErrCh:              make(chan error),
+		SubcribedMessageTypes: []messaging.MessageType{
+			messaging.AnnounceDataResponse,
+			messaging.FileFinished,
+		},
+	}
+}
+
+func (mngr *TrackerManager) setupTracker() {
+
+	port, err := strconv.Atoi(mngr.Tracker.url.Port())
+	if err != nil {
+		mngr.ErrCh <- errors.New("failed to parse tracker port, aborting")
+		return
+	}
+
+	req := AnnounceRequest{
+		infoHash:   mngr.Metainfo.Infohash,
+		peerID:     mngr.ClientId,
+		port:       uint16(port),
+		uploaded:   0, // READ FROM MSG
+		downloaded: 0, // READ FROM MSG
+		left:       mngr.Metainfo.InfoDict.Length,
+		event:      "started",
+	}
+
+	trackerResponseCh := make(chan AnnounceResponse)
+	if len(mngr.Metainfo.AnnounceList) == 0 {
+
+		trackerUrl, err := url.Parse(mngr.Metainfo.Announce)
+		if err != nil {
+			mngr.ErrCh <- errors.New("failed to parse announce URL")
+		}
+
+		tracker := NewTracker(*trackerUrl)
+
+		mngr.WaitGroup.Add(1)
+		go tracker.Announce(&mngr.WaitGroup, context.Background(), req, trackerResponseCh, mngr.ErrCh)
+
+		timer := time.NewTimer(15 * time.Second)
+		select {
+		case trackerResponse := <-trackerResponseCh:
+			mngr.WaitGroup.Wait()
+			close(trackerResponseCh)
+			mngr.Tracker = trackerResponse.tracker
+			mngr.Tracker.interval = trackerResponse.interval
+			mngr.Tracker.peers = trackerResponse.peers
+
+			for _, p := range mngr.Tracker.peers {
+				mngr.Tracker.peerMap[p.Id] = true
+			}
+
+			timer.Stop()
+			break
+
+		case <-timer.C:
+			mngr.ErrCh <- errors.New("tracker response timed out")
+			timer.Stop()
+			return
+		}
+
+	} else {
+		for _, trackers := range mngr.Metainfo.AnnounceList {
+			for _, tracker := range trackers {
+
+				trackerUrl, err := url.Parse(tracker)
+				if err != nil {
+					mngr.ErrCh <- errors.New("failed to parse announce URL")
+				}
+
+				tracker := NewTracker(*trackerUrl)
+				mngr.WaitGroup.Add(1)
+				go tracker.Announce(&mngr.WaitGroup, context.Background(), req, trackerResponseCh, mngr.ErrCh)
+			}
+
+			timer := time.NewTimer(15 * time.Second)
+			select {
+			case trackerResponse := <-trackerResponseCh:
+				mngr.WaitGroup.Wait()
+				timer.Stop()
+				close(trackerResponseCh)
+
+				mngr.Tracker = trackerResponse.tracker
+				mngr.Tracker.interval = trackerResponse.interval
+				mngr.Tracker.peers = trackerResponse.peers
+
+				for _, p := range mngr.Tracker.peers {
+					mngr.Tracker.peerMap[p.Id] = true
+				}
+
+				break
+
+			case <-timer.C:
+				timer.Stop()
+				continue
+			}
+		}
 	}
 }
 
 func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	mngr.setupTracker()
+	for _, peer := range mngr.Tracker.peers {
+		mngr.SendCh <- messaging.Message{
+			MessageType: messaging.PeerSend,
+			Data:        peer,
+		}
+	}
+
+	lastIterTime := time.Now()
+	for {
+
+		var timer time.Timer
+		if mngr.Tracker.interval != 0 {
+			mngr.Tracker.interval = mngr.Tracker.interval - time.Since(lastIterTime)
+			timer = *time.NewTimer(mngr.Tracker.interval)
+		} else {
+			timer = *time.NewTimer(0)
+		}
+
+		select {
+		case msg := <-mngr.RecvCh:
+			switch msg.MessageType {
+			case messaging.AnnounceDataResponse:
+
+				payload, ok := msg.Data.(messaging.AnnounceDataResponseData)
+				if !ok {
+					mngr.ErrCh <- errors.New("router sent wrong datatype, aborting")
+					return
+				}
+
+				port, err := strconv.Atoi(mngr.Tracker.url.Port())
+				if err != nil {
+					mngr.ErrCh <- errors.New("failed to parse tracker port, aborting")
+					return
+				}
+
+				req := AnnounceRequest{
+					infoHash:   mngr.Metainfo.Infohash,
+					peerID:     mngr.ClientId,
+					port:       uint16(port),
+					uploaded:   payload.Uploaded,   // READ FROM MSG
+					downloaded: payload.Downloaded, // READ FROM MSG
+					left:       payload.Left,
+					event:      payload.Event,
+				}
+
+				go mngr.Tracker.Announce(&mngr.WaitGroup, ctx, req, mngr.AnnounceResponseCh, mngr.ErrCh)
+
+			}
+
+		case msg := <-mngr.AnnounceResponseCh:
+
+			mngr.IsWaitingForAnnounceData = false
+			mngr.Tracker.interval = msg.interval
+
+			for _, peer := range msg.peers {
+				if !mngr.Tracker.peerMap[peer.Id] {
+					mngr.SendCh <- messaging.Message{
+						MessageType: messaging.PeerSend,
+						Data:        peer,
+					}
+					mngr.Tracker.peers = append(mngr.Tracker.peers, peer)
+					mngr.Tracker.peerMap[peer.Id] = true
+				}
+			}
+
+		case <-timer.C:
+			if !mngr.IsWaitingForAnnounceData {
+				mngr.SendCh <- messaging.Message{
+					MessageType: messaging.AnnounceDataRequest,
+					Data:        nil,
+				}
+			}
+		}
+
+		lastIterTime = time.Now()
+		timer.Stop()
+
+	}
 
 }
 
@@ -144,6 +332,9 @@ func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req Announce
 	} else {
 		t.interval = time.Second * 30
 	}
+
+	resp.tracker = t
+
 	respCh <- resp
 }
 
@@ -264,8 +455,8 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerUrl url.URL, req Annou
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("response parsing failed: %w", err)
 	}
-	return announceResp, nil
 
+	return announceResp, nil
 }
 
 func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req AnnounceRequest, conn net.Conn) (AnnounceResponse, error) {

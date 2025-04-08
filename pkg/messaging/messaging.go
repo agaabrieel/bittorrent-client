@@ -27,6 +27,7 @@ const (
 	PeerUpdate
 	AnnounceDataRequest
 	AnnounceDataResponse
+	TrackerData
 	PieceValidated
 	PieceInvalidated
 	FileFinished
@@ -51,4 +52,29 @@ func (r *Router) Start(commCh chan Message) {
 			ch <- msg
 		}
 	}
+}
+
+type BlockRequestData struct {
+	Index  uint32
+	Offset uint32
+}
+
+type BlockSendData struct {
+	Index  uint32
+	Offset uint32
+	Size   uint32
+	Data   []byte
+}
+
+type AnnounceDataRequestData struct {
+}
+
+type AnnounceDataResponseData struct {
+	Uploaded   uint64
+	Downloaded uint64
+	Left       uint64
+	Event      string
+}
+
+type FileFinishedData struct {
 }
