@@ -535,7 +535,7 @@ func (mngr *PeerManager) getWantedPieces(p *Peer) bitfield.BitfieldMask {
 	mngr.Mutex.Lock()
 	defer mngr.Mutex.Unlock()
 
-	var WantedPieces bitfield.BitfieldMask
+	WantedPieces := make(bitfield.BitfieldMask, len(mngr.Bitfield))
 	for i := range mngr.Bitfield {
 		WantedPieces[i] = ((mngr.Bitfield[i] ^ p.Bitfield[i]) & p.Bitfield[i])
 	}

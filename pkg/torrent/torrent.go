@@ -134,7 +134,7 @@ func performHandshake(ctx context.Context, conn net.Conn, wg *sync.WaitGroup, se
 	for readBytes < len(handshakeBuffer) {
 		n, err := conn.Read(handshakeBuffer[readBytes:])
 		if err != nil {
-			log.Default().Printf("failed to read from peer: %w", err)
+			log.Default().Printf("failed to read from peer: %v", err)
 			conn.Close()
 			continue
 		}
@@ -181,7 +181,7 @@ func performHandshake(ctx context.Context, conn net.Conn, wg *sync.WaitGroup, se
 	for writtenBytes < handshake.Len() {
 		n, err := conn.Write(handshake.Bytes()[writtenBytes:])
 		if err != nil {
-			log.Default().Printf("failed to write to peer: %w", err)
+			log.Default().Printf("failed to write to peer: %v", err)
 			conn.Close()
 			return
 		}
