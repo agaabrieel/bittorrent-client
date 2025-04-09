@@ -72,11 +72,11 @@ type PeerManager struct {
 	ErrorCh     chan<- error
 }
 
-func NewPeerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message) *PeerManager {
+func NewPeerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, id [20]byte) *PeerManager {
 
 	recvCh := make(chan messaging.Message, 256)
 
-	r.Subscribe(messaging.PeerSend, recvCh)
+	r.Subscribe(messaging.NewPeerFromTracker, recvCh)
 	r.Subscribe(messaging.PeerUpdate, recvCh)
 	r.Subscribe(messaging.BlockSend, recvCh)
 	r.Subscribe(messaging.PieceInvalidated, recvCh)
@@ -85,9 +85,10 @@ func NewPeerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh
 
 	return &PeerManager{
 		Peers:     make([]Peer, 100),
+		id:        id,
 		infohash:  meta.Infohash,
 		Bitfield:  bitfield.NewBitfield(uint32(float64((meta.InfoDict.Length / meta.InfoDict.PieceLength) / 8))),
-		ErrorCh:   make(chan error, 1),
+		ErrorCh:   make(chan error, 256),
 		RecvCh:    recvCh,
 		SendCh:    globalCh,
 		Mutex:     sync.RWMutex{},
@@ -104,21 +105,27 @@ func NewPeerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh
 
 func (mngr *PeerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
+	defer wg.Done()
 	childCtx, ctxCancel := context.WithCancel(ctx)
 
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
 			switch msg.MessageType {
-			case messaging.PeerSend:
+			case messaging.NewPeerFromTracker, messaging.NewPeerConnection:
 
-				payload, ok := msg.Data.(Peer)
+				peer, ok := msg.Data.(Peer)
 				if !ok {
 					mngr.ErrorCh <- errors.New("payload has incorrect type")
 					ctxCancel()
 				}
 
-				go mngr.handlePeer(&payload, childCtx, wg)
+				wg.Add(1)
+				if msg.MessageType == messaging.NewPeerFromTracker {
+					go peer.startHandshake(childCtx, wg, mngr.ErrorCh, mngr.infohash, mngr.id)
+				} else {
+					go peer.replyToHandshake(childCtx, wg, mngr.ErrorCh, mngr.infohash, mngr.id)
+				}
 
 			}
 		case <-ctx.Done():
@@ -128,41 +135,198 @@ func (mngr *PeerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context, wg *sync.WaitGroup) {
+func (p *Peer) startHandshake(ctx context.Context, wg *sync.WaitGroup, errCh chan<- error, infohash [20]byte, clientId [20]byte) {
+
+	defer wg.Done()
+
+	// Dials connection
+	conn, err := net.Dial("tcp", p.Ip.String()+strconv.Itoa(int(p.Port)))
+	if err != nil {
+		errCh <- fmt.Errorf("failed to connect to peer: %w", err)
+	}
+
+	defer func() {
+		if err != nil {
+			conn.Close()
+		}
+	}()
+
+	// Generates handshake msg
+	var Handshake bytes.Buffer
+	Handshake.WriteByte(0x13)
+	Handshake.WriteString("BitTorrent protocol")
+	Handshake.Write(make([]byte, 8))
+	Handshake.Write(infohash[:])
+	Handshake.Write(clientId[:])
+
+	if Handshake.Len() != 68 {
+		errCh <- fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len())
+	}
+
+	// Sets write deadline
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetWriteDeadline(deadline)
+	} else {
+		conn.SetWriteDeadline(time.Now().Add(time.Second * 30))
+	}
+
+	// Writes handshake message
+	writtenBytes := 0
+	for writtenBytes < Handshake.Len() {
+		n, err := conn.Write(Handshake.Bytes()[writtenBytes:])
+		if err != nil {
+			errCh <- fmt.Errorf("failed to write to peer: %w", err)
+		}
+		writtenBytes += n
+	}
+
+	// Sets read deadline
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetReadDeadline(deadline)
+	} else {
+		conn.SetReadDeadline(time.Now().Add(time.Second * 30))
+	}
+
+	// reads handshake response
+	responseBuffer := make([]byte, 68)
+	readBytes := 0
+	for readBytes < len(responseBuffer) {
+		n, err := conn.Read(responseBuffer[readBytes:])
+		if err != nil {
+			errCh <- fmt.Errorf("failed to write to peer: %w", err)
+		}
+		readBytes += n
+	}
+
+	if !bytes.Equal(responseBuffer[0:28], Handshake.Bytes()[:28]) {
+		errCh <- fmt.Errorf("peer sent incorrect handshake")
+	}
+
+	if !bytes.Equal(responseBuffer[28:48], Handshake.Bytes()[28:48]) {
+		errCh <- fmt.Errorf("info hash sent by peer doesn't match ours")
+	}
+
+	peerID := *(*[20]byte)(responseBuffer[48:68])
+	if p.Id != peerID && p.Id != [20]byte{} {
+		errCh <- fmt.Errorf("peer ID changed: was %x, now %x", p.Id, peerID)
+	}
+
+	p.Id = peerID
+	p.IsChoked = true
+	p.IsInterested = false
+	p.IsChoking = true
+	p.IsInteresting = false
+	p.LastActive = time.Now()
+	p.Conn = conn
+	p.LastMessage = PeerMessage{
+		messageType: HandshakeResponse,
+		data:        nil,
+	}
+
+	go p.mainLoop(ctx, wg)
+}
+
+func (p *Peer) replyToHandshake(ctx context.Context, wg *sync.WaitGroup, errCh chan<- error, infohash [20]byte, clientId [20]byte) {
+
+	defer wg.Done()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		p.Conn.SetReadDeadline(deadline)
+	} else {
+		p.Conn.SetReadDeadline(time.Now().Add(time.Second * 30))
+	}
+
+	handshakeBuffer := make([]byte, 68)
+	readBytes := 0
+	for readBytes < len(handshakeBuffer) {
+		n, err := p.Conn.Read(handshakeBuffer[readBytes:])
+		if err != nil {
+			errCh <- fmt.Errorf("failed to read from peer: %v", err)
+			p.Conn.Close()
+			return
+		}
+		readBytes += n
+	}
+
+	if len(handshakeBuffer) != 68 {
+		errCh <- fmt.Errorf("incorrect handshake size, expected 68 bytes, got %d", len(handshakeBuffer))
+		p.Conn.Close()
+		return
+	}
+
+	// Generates handshake msg
+	var handshake bytes.Buffer
+	handshake.WriteByte(0x13)
+	handshake.WriteString("BitTorrent protocol")
+	handshake.Write(make([]byte, 8))
+	handshake.Write(infohash[:])
+	handshake.Write(clientId[:])
+
+	if !bytes.Equal(handshakeBuffer[0:28], handshake.Bytes()[:28]) {
+		errCh <- fmt.Errorf("peer sent incorrect handshake")
+		p.Conn.Close()
+		return
+	}
+
+	if !bytes.Equal(handshakeBuffer[28:48], handshake.Bytes()[28:48]) {
+		errCh <- fmt.Errorf("info hash sent by peer doesn't match ours")
+		p.Conn.Close()
+		return
+	}
+
+	peerID := *(*[20]byte)(handshakeBuffer[48:68])
+
+	// Sets write deadline
+	if deadline, ok := ctx.Deadline(); ok {
+		p.Conn.SetWriteDeadline(deadline)
+	} else {
+		p.Conn.SetWriteDeadline(time.Now().Add(time.Second * 30))
+	}
+
+	// Writes handshake message
+	writtenBytes := 0
+	for writtenBytes < handshake.Len() {
+		n, err := p.Conn.Write(handshake.Bytes()[writtenBytes:])
+		if err != nil {
+			errCh <- fmt.Errorf("failed to write to peer: %v", err)
+			p.Conn.Close()
+			return
+		}
+		writtenBytes += n
+	}
+
+	p.Id = peerID
+	p.IsChoked = true
+	p.IsChoking = true
+	p.IsInterested = false
+	p.IsInteresting = false
+	p.LastActive = time.Now()
+	p.LastMessage = PeerMessage{}
+
+	go p.mainLoop(ctx, wg)
+
+}
+
+func (p *Peer) mainLoop(ctx context.Context, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 	defer p.Conn.Close()
-
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	// Resolves address
-	addr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(p.Ip.String(), strconv.Itoa(int(p.Port))))
-	if err != nil {
-		mngr.ErrorCh <- fmt.Errorf("failed to resolve tcp address from peer: %w", err)
-	}
-
-	err = doHandshake(p, ctx, *addr, mngr.infohash, mngr.id)
-	if err != nil {
-		mngr.ErrorCh <- fmt.Errorf("failed to establish handshake with peer %x: %w", p.Id[:], err)
-	}
 
 	peerRecvCh := make(chan PeerMessage, 1024)
 	peerSendCh := make(chan []byte, 1024)
 
 	// Writer loop
-	mngr.Waitgroup.Add(1)
+	wg.Add(1)
 	go func() {
-		defer mngr.Waitgroup.Done()
-		go writeLoop(p, ctx, peerSendCh)
+		defer wg.Done()
+		go p.writeLoop(ctx, peerSendCh)
 	}()
 
 	// Reader loop
-	mngr.Waitgroup.Add(1)
+	wg.Add(1)
 	go func() {
-		defer mngr.Waitgroup.Done()
-		go readLoop(p, ctx, peerRecvCh)
+		defer wg.Done()
+		go p.readLoop(ctx, peerRecvCh)
 	}()
 
 	for {
@@ -278,96 +442,7 @@ func (mngr *PeerManager) handlePeer(p *Peer, ctx context.Context, wg *sync.WaitG
 	}
 }
 
-func doHandshake(p *Peer, ctx context.Context, addr net.TCPAddr, hash [20]byte, id [20]byte) error {
-
-	// Dials connection
-	conn, err := net.Dial("tcp", addr.String())
-	if err != nil {
-		return fmt.Errorf("failed to connect to peer: %w", err)
-	}
-
-	defer func() {
-		if err != nil {
-			conn.Close()
-		}
-	}()
-
-	// Generates handshake msg
-	var Handshake bytes.Buffer
-	Handshake.WriteByte(0x13)
-	Handshake.WriteString("BitTorrent protocol")
-	Handshake.Write(make([]byte, 8))
-	Handshake.Write(hash[:])
-	Handshake.Write(id[:])
-
-	if Handshake.Len() != 68 {
-		return fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len())
-	}
-
-	// Sets write deadline
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetWriteDeadline(deadline)
-	} else {
-		conn.SetWriteDeadline(time.Now().Add(time.Second * 30))
-	}
-
-	// Writes handshake message
-	writtenBytes := 0
-	for writtenBytes < Handshake.Len() {
-		n, err := conn.Write(Handshake.Bytes()[writtenBytes:])
-		if err != nil {
-			return fmt.Errorf("failed to write to peer: %w", err)
-		}
-		writtenBytes += n
-	}
-
-	// Sets read deadline
-	if deadline, ok := ctx.Deadline(); ok {
-		conn.SetReadDeadline(deadline)
-	} else {
-		conn.SetReadDeadline(time.Now().Add(time.Second * 30))
-	}
-
-	// reads handshake response
-	responseBuffer := make([]byte, 68)
-	readBytes := 0
-	for readBytes < len(responseBuffer) {
-		n, err := conn.Read(responseBuffer[readBytes:])
-		if err != nil {
-			return fmt.Errorf("failed to write to peer: %w", err)
-		}
-		readBytes += n
-	}
-
-	if !bytes.Equal(responseBuffer[0:28], Handshake.Bytes()[:28]) {
-		return fmt.Errorf("peer sent incorrect handshake")
-	}
-
-	if !bytes.Equal(responseBuffer[28:48], Handshake.Bytes()[28:48]) {
-		return fmt.Errorf("info hash sent by peer doesn't match ours")
-	}
-
-	peerID := *(*[20]byte)(responseBuffer[48:68])
-	if p.Id != peerID && p.Id != [20]byte{} {
-		return fmt.Errorf("peer ID changed: was %x, now %x", p.Id, peerID)
-	}
-
-	p.Id = peerID
-	p.IsChoked = true
-	p.IsInterested = false
-	p.IsChoking = true
-	p.IsInteresting = false
-	p.LastActive = time.Now()
-	p.Conn = conn
-	p.LastMessage = PeerMessage{
-		messageType: HandshakeResponse,
-		data:        nil,
-	}
-
-	return nil
-}
-
-func readLoop(p *Peer, ctx context.Context, recvCh chan<- PeerMessage) {
+func (p *Peer) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
@@ -424,12 +499,12 @@ func readLoop(p *Peer, ctx context.Context, recvCh chan<- PeerMessage) {
 				}
 
 				if msgLen == 4 {
-					recvCh <- PeerMessage{
+					sendCh <- PeerMessage{
 						data:        fullMsg,
 						messageType: KeepAlive,
 					}
 				} else {
-					recvCh <- PeerMessage{
+					sendCh <- PeerMessage{
 						data:        fullMsg,
 						messageType: PeerMessageType(fullMsg[4]),
 					}
@@ -439,7 +514,7 @@ func readLoop(p *Peer, ctx context.Context, recvCh chan<- PeerMessage) {
 	}
 }
 
-func writeLoop(p *Peer, ctx context.Context, sendCh <-chan []byte) {
+func (p *Peer) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
@@ -455,7 +530,7 @@ func writeLoop(p *Peer, ctx context.Context, sendCh <-chan []byte) {
 			return
 		case <-timer.C:
 			return
-		case msg := <-sendCh:
+		case msg := <-recvCh:
 
 			totalLen := len(msg)
 

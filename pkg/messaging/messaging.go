@@ -23,7 +23,8 @@ type MessageType uint8
 const (
 	BlockRequest MessageType = iota
 	BlockSend
-	PeerSend
+	NewPeerFromTracker
+	NewPeerConnection
 	PeerUpdate
 	AnnounceDataRequest
 	AnnounceDataResponse

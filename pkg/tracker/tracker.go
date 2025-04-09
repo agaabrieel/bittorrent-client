@@ -84,7 +84,7 @@ type TrackerManager struct {
 	SubcribedMessageTypes    []messaging.MessageType
 }
 
-func NewTrackerManager(meta metainfo.TorrentMetainfo, ourId [20]byte, r *messaging.Router, globalCh chan messaging.Message) *TrackerManager {
+func NewTrackerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, ourId [20]byte) *TrackerManager {
 
 	recvCh := make(chan messaging.Message, 256)
 
@@ -192,8 +192,6 @@ func (mngr *TrackerManager) setupTracker() {
 					mngr.Tracker.peerMap[p.Id] = true
 				}
 
-				break
-
 			case <-timer.C:
 				timer.Stop()
 				continue
@@ -208,7 +206,7 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	mngr.setupTracker()
 	for _, peer := range mngr.Tracker.peers {
 		mngr.SendCh <- messaging.Message{
-			MessageType: messaging.PeerSend,
+			MessageType: messaging.NewPeerFromTracker,
 			Data:        peer,
 		}
 	}
@@ -261,7 +259,7 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			for _, peer := range msg.peers {
 				if !mngr.Tracker.peerMap[peer.Id] {
 					mngr.SendCh <- messaging.Message{
-						MessageType: messaging.PeerSend,
+						MessageType: messaging.NewPeerFromTracker,
 						Data:        peer,
 					}
 					mngr.Tracker.peers = append(mngr.Tracker.peers, peer)
