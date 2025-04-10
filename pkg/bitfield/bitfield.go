@@ -28,3 +28,21 @@ func (bf *BitfieldMask) ZeroBitfield() {
 func (bf *BitfieldMask) ZeroPiece(idx uint32) {
 	(*bf)[idx] = byte(0x00)
 }
+
+func (bf BitfieldMask) GetDifference(other BitfieldMask) BitfieldMask {
+
+	difference := make(BitfieldMask, len(bf))
+	for i := range bf {
+		difference[i] = bf[i] ^ other[i]
+	}
+	return difference
+}
+
+func (bf BitfieldMask) GetIntersection(other BitfieldMask) BitfieldMask {
+
+	intersection := make(BitfieldMask, len(bf))
+	for i := range bf {
+		intersection[i] = bf[i] & other[i]
+	}
+	return intersection
+}

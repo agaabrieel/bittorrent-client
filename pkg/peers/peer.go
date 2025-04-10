@@ -44,12 +44,12 @@ type PeerMessage struct {
 	messageType PeerMessageType
 }
 
-type Peer struct {
-	Id              [20]byte
-	Ip              net.IP
-	Port            uint16
-	Conn            net.Conn
-	Bitfield        bitfield.BitfieldMask
+type PeerManager struct {
+	PeerId          [20]byte
+	PeerIp          net.IP
+	PeerPort        uint16
+	PeerConn        net.Conn
+	PeerBitfield    bitfield.BitfieldMask
 	IsInterested    bool
 	IsInteresting   bool
 	IsChoked        bool
@@ -57,22 +57,30 @@ type Peer struct {
 	PiecesRequested []PeerMessage
 	LastActive      time.Time
 	LastMessage     PeerMessage
+	WaitGroup       *sync.WaitGroup
+	Mutex           *sync.Mutex
+	OrchestratorSendCh chan int
+	OrchestratorRecvCh chan int
 }
 
-type PeerManager struct {
-	id          [20]byte
-	infohash    [20]byte
-	AskedBlocks []piece.Block
-	Bitfield    bitfield.BitfieldMask
-	Peers       []Peer
-	Mutex       sync.RWMutex
-	Waitgroup   sync.WaitGroup
-	SendCh      chan<- messaging.Message
-	RecvCh      <-chan messaging.Message
-	ErrorCh     chan<- error
+type PeerConnection struct {
+	net.Conn
 }
 
-func NewPeerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, id [20]byte) *PeerManager {
+type PeerOrchestrator struct {
+	clientId       [20]byte
+	clientInfohash [20]byte
+	AskedBlocks    []piece.Block
+	Bitfield       bitfield.BitfieldMask
+	Peers          []PeerManager
+	Mutex          sync.RWMutex
+	Waitgroup      sync.WaitGroup
+	SendCh         chan<- messaging.Message
+	RecvCh         <-chan messaging.Message
+	ErrorCh        chan<- error
+}
+
+func NewPeerOrchestrator(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, id [20]byte) *PeerOrchestrator {
 
 	recvCh := make(chan messaging.Message, 256)
 
@@ -83,27 +91,20 @@ func NewPeerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh
 	r.Subscribe(messaging.PieceValidated, recvCh)
 	r.Subscribe(messaging.FileFinished, recvCh)
 
-	return &PeerManager{
-		Peers:     make([]Peer, 100),
-		id:        id,
-		infohash:  meta.Infohash,
-		Bitfield:  bitfield.NewBitfield(uint32(float64((meta.InfoDict.Length / meta.InfoDict.PieceLength) / 8))),
-		ErrorCh:   make(chan error, 256),
-		RecvCh:    recvCh,
-		SendCh:    globalCh,
-		Mutex:     sync.RWMutex{},
-		Waitgroup: sync.WaitGroup{},
+	return &PeerOrchestrator{
+		Peers:          make([]PeerManager, 100),
+		clientId:       id,
+		clientInfohash: meta.Infohash,
+		Bitfield:       bitfield.NewBitfield(uint32(float64((meta.InfoDict.Length / meta.InfoDict.PieceLength) / 8))),
+		ErrorCh:        make(chan error, 256),
+		RecvCh:         recvCh,
+		SendCh:         globalCh,
+		Mutex:          sync.RWMutex{},
+		Waitgroup:      sync.WaitGroup{},
 	}
 }
 
-// r.Subscribe(messaging.PeerSend, recvCh)
-// r.Subscribe(messaging.PeerUpdate, recvCh)
-// r.Subscribe(messaging.BlockSend, recvCh)
-// r.Subscribe(messaging.PieceInvalidated, recvCh)
-// r.Subscribe(messaging.PieceValidated, recvCh)
-// r.Subscribe(messaging.FileFinished, recvCh)
-
-func (mngr *PeerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
+func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 	childCtx, ctxCancel := context.WithCancel(ctx)
@@ -114,7 +115,7 @@ func (mngr *PeerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			switch msg.MessageType {
 			case messaging.NewPeerFromTracker, messaging.NewPeerConnection:
 
-				peer, ok := msg.Data.(Peer)
+				peerMngr, ok := msg.Data.(PeerManager)
 				if !ok {
 					mngr.ErrorCh <- errors.New("payload has incorrect type")
 					ctxCancel()
@@ -122,9 +123,11 @@ func (mngr *PeerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 				wg.Add(1)
 				if msg.MessageType == messaging.NewPeerFromTracker {
-					go peer.startHandshake(childCtx, wg, mngr.ErrorCh, mngr.infohash, mngr.id)
+					peerMngr.WaitGroup.Add(1)
+					go peerMngr.startPeerHandshake(childCtx, mngr.ErrorCh, mngr.clientInfohash, mngr.clientId)
 				} else {
-					go peer.replyToHandshake(childCtx, wg, mngr.ErrorCh, mngr.infohash, mngr.id)
+					peerMngr.WaitGroup.Add(1)
+					go peerMngr.replyToPeerHandshake(childCtx, mngr.ErrorCh, mngr.clientInfohash, mngr.clientId)
 				}
 
 			}
@@ -135,12 +138,12 @@ func (mngr *PeerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func (p *Peer) startHandshake(ctx context.Context, wg *sync.WaitGroup, errCh chan<- error, infohash [20]byte, clientId [20]byte) {
+func (p *PeerManager) startPeerHandshake(ctx context.Context, errCh chan<- error, infohash [20]byte, clientId [20]byte) {
 
-	defer wg.Done()
+	defer p.WaitGroup.Done()
 
 	// Dials connection
-	conn, err := net.Dial("tcp", p.Ip.String()+strconv.Itoa(int(p.Port)))
+	conn, err := net.Dial("tcp", p.PeerIp.String()+strconv.Itoa(int(p.PeerPort)))
 	if err != nil {
 		errCh <- fmt.Errorf("failed to connect to peer: %w", err)
 	}
@@ -207,42 +210,43 @@ func (p *Peer) startHandshake(ctx context.Context, wg *sync.WaitGroup, errCh cha
 	}
 
 	peerID := *(*[20]byte)(responseBuffer[48:68])
-	if p.Id != peerID && p.Id != [20]byte{} {
-		errCh <- fmt.Errorf("peer ID changed: was %x, now %x", p.Id, peerID)
+	if p.PeerId != peerID && p.PeerId != [20]byte{} {
+		errCh <- fmt.Errorf("peer ID changed: was %x, now %x", p.PeerId, peerID)
 	}
 
-	p.Id = peerID
+	p.PeerId = peerID
 	p.IsChoked = true
 	p.IsInterested = false
 	p.IsChoking = true
 	p.IsInteresting = false
 	p.LastActive = time.Now()
-	p.Conn = conn
+	p.PeerConn = conn
 	p.LastMessage = PeerMessage{
 		messageType: HandshakeResponse,
 		data:        nil,
 	}
 
-	go p.mainLoop(ctx, wg)
+	p.WaitGroup.Add(1)
+	go p.mainLoop(ctx)
 }
 
-func (p *Peer) replyToHandshake(ctx context.Context, wg *sync.WaitGroup, errCh chan<- error, infohash [20]byte, clientId [20]byte) {
+func (p *PeerManager) replyToPeerHandshake(ctx context.Context, errCh chan<- error, infohash [20]byte, clientId [20]byte) {
 
-	defer wg.Done()
+	defer p.WaitGroup.Done()
 
 	if deadline, ok := ctx.Deadline(); ok {
-		p.Conn.SetReadDeadline(deadline)
+		p.PeerConn.SetReadDeadline(deadline)
 	} else {
-		p.Conn.SetReadDeadline(time.Now().Add(time.Second * 30))
+		p.PeerConn.SetReadDeadline(time.Now().Add(time.Second * 30))
 	}
 
 	handshakeBuffer := make([]byte, 68)
 	readBytes := 0
 	for readBytes < len(handshakeBuffer) {
-		n, err := p.Conn.Read(handshakeBuffer[readBytes:])
+		n, err := p.PeerConn.Read(handshakeBuffer[readBytes:])
 		if err != nil {
 			errCh <- fmt.Errorf("failed to read from peer: %v", err)
-			p.Conn.Close()
+			p.PeerConn.Close()
 			return
 		}
 		readBytes += n
@@ -250,7 +254,7 @@ func (p *Peer) replyToHandshake(ctx context.Context, wg *sync.WaitGroup, errCh c
 
 	if len(handshakeBuffer) != 68 {
 		errCh <- fmt.Errorf("incorrect handshake size, expected 68 bytes, got %d", len(handshakeBuffer))
-		p.Conn.Close()
+		p.PeerConn.Close()
 		return
 	}
 
@@ -264,13 +268,13 @@ func (p *Peer) replyToHandshake(ctx context.Context, wg *sync.WaitGroup, errCh c
 
 	if !bytes.Equal(handshakeBuffer[0:28], handshake.Bytes()[:28]) {
 		errCh <- fmt.Errorf("peer sent incorrect handshake")
-		p.Conn.Close()
+		p.PeerConn.Close()
 		return
 	}
 
 	if !bytes.Equal(handshakeBuffer[28:48], handshake.Bytes()[28:48]) {
 		errCh <- fmt.Errorf("info hash sent by peer doesn't match ours")
-		p.Conn.Close()
+		p.PeerConn.Close()
 		return
 	}
 
@@ -278,24 +282,24 @@ func (p *Peer) replyToHandshake(ctx context.Context, wg *sync.WaitGroup, errCh c
 
 	// Sets write deadline
 	if deadline, ok := ctx.Deadline(); ok {
-		p.Conn.SetWriteDeadline(deadline)
+		p.PeerConn.SetWriteDeadline(deadline)
 	} else {
-		p.Conn.SetWriteDeadline(time.Now().Add(time.Second * 30))
+		p.PeerConn.SetWriteDeadline(time.Now().Add(time.Second * 30))
 	}
 
 	// Writes handshake message
 	writtenBytes := 0
 	for writtenBytes < handshake.Len() {
-		n, err := p.Conn.Write(handshake.Bytes()[writtenBytes:])
+		n, err := p.PeerConn.Write(handshake.Bytes()[writtenBytes:])
 		if err != nil {
 			errCh <- fmt.Errorf("failed to write to peer: %v", err)
-			p.Conn.Close()
+			p.PeerConn.Close()
 			return
 		}
 		writtenBytes += n
 	}
 
-	p.Id = peerID
+	p.PeerId = peerID
 	p.IsChoked = true
 	p.IsChoking = true
 	p.IsInterested = false
@@ -303,146 +307,153 @@ func (p *Peer) replyToHandshake(ctx context.Context, wg *sync.WaitGroup, errCh c
 	p.LastActive = time.Now()
 	p.LastMessage = PeerMessage{}
 
-	go p.mainLoop(ctx, wg)
+	p.WaitGroup.Add(1)
+	go p.mainLoop(ctx)
 
 }
 
-func (p *Peer) mainLoop(ctx context.Context, wg *sync.WaitGroup) {
+func (p *PeerManager) mainLoop(ctx context.Context) {
 
-	defer wg.Done()
-	defer p.Conn.Close()
+	defer p.WaitGroup.Done()
+	defer p.PeerConn.Close()
 
 	peerRecvCh := make(chan PeerMessage, 1024)
 	peerSendCh := make(chan []byte, 1024)
+	peerMsgCh := make(chan PeerMessage, 1024)
 
 	// Writer loop
-	wg.Add(1)
+	p.WaitGroup.Add(1)
 	go func() {
-		defer wg.Done()
+		defer p.WaitGroup.Done()
 		go p.writeLoop(ctx, peerSendCh)
 	}()
 
 	// Reader loop
-	wg.Add(1)
+	p.WaitGroup.Add(1)
 	go func() {
-		defer wg.Done()
+		defer p.WaitGroup.Done()
 		go p.readLoop(ctx, peerRecvCh)
 	}()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
+	p.WaitGroup.Add(1)
+	go func() {
+		// Msg processing loop
+		defer p.WaitGroup.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				return
 
-		case msg := <-peerRecvCh:
-			p.LastMessage = msg
-			p.LastActive = time.Now()
-			switch msg.messageType {
+			case msg := <-peerRecvCh:
+				p.LastMessage = msg
+				p.LastActive = time.Now()
+				switch msg.messageType {
 
-			// First 6 cases simply update the internal peer status
-			case Choke:
-				p.IsChoking = true
+				// First 6 cases simply update the internal peer status
+				case Choke:
+					p.IsChoking = true
 
-			case Unchoke:
-				p.IsChoking = false
+				case Unchoke:
+					p.IsChoking = false
 
-			case NotInterested:
-				p.IsInterested = false
+				case NotInterested:
+					p.IsInterested = false
 
-			case Interested:
-				p.IsInterested = true
+				case Interested:
+					p.IsInterested = true
 
-			case Bitfield:
-				p.Bitfield = msg.data
-				wantedPieces := mngr.getWantedPieces(p)
+				case Bitfield:
+					p.PeerBitfield = msg.data
+					wantedPieces := p.PeerBitfield.
 
-				if wantedPieces != nil {
-					if !p.IsInteresting {
-						peerSendCh <- mngr.generateNoPayloadMsg(Interested)
-						p.IsInteresting = true
+					if len(wantedPieces) != 0 {
+						if !p.IsInteresting {
+							p.IsInteresting = true
+						}
+					} else if p.IsInteresting {
+						p.IsInteresting = false
 					}
-				} else if p.IsInteresting {
-					peerSendCh <- mngr.generateNoPayloadMsg(NotInterested)
-					p.IsInteresting = false
-				}
 
-			case Have:
-				p.Bitfield.SetPiece(binary.BigEndian.Uint32(msg.data[5:]))
-				wantedPieces := mngr.getWantedPieces(p)
+				case Have:
+					p.PeerBitfield.SetPiece(binary.BigEndian.Uint32(msg.data[5:]))
+					wantedPieces := mngr.getWantedPieces(p)
 
-				if wantedPieces != nil {
-					if !p.IsInteresting {
-						peerSendCh <- mngr.generateNoPayloadMsg(Interested)
-						p.IsInteresting = true
+					if wantedPieces != nil {
+						if !p.IsInteresting {
+							peerSendCh <- mngr.generateNoPayloadMsg(Interested)
+							p.IsInteresting = true
+						}
+					} else if p.IsInteresting {
+						peerSendCh <- mngr.generateNoPayloadMsg(NotInterested)
+						p.IsInteresting = false
 					}
-				} else if p.IsInteresting {
-					peerSendCh <- mngr.generateNoPayloadMsg(NotInterested)
-					p.IsInteresting = false
+
+				// Most actions will happen as responses to these 2 message types, as the default case or after the timer
+				case Request:
+
+					if p.IsChoked {
+						return
+					}
+
+					if binary.BigEndian.Uint32(msg.data[13:17]) > piece.BLOCK_SIZE {
+						return
+						//errCh <- fmt.Errorf("peer request has size size %d, expected 16 Kb or smaller", requestedPieceLen)
+					}
+
+					msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1)
+					copy(msgData[:], msg.data[5:])
+
+					mngr.SendCh <- messaging.Message{
+						MessageType: messaging.BlockRequest,
+						Data:        msgData,
+					}
+
+					reply := <-mngr.RecvCh
+
+					payload, ok := reply.Data.(messaging.BlockSendData)
+					if !ok {
+						mngr.ErrorCh <- errors.New("wrong payload type")
+						continue
+					}
+
+					peerSendCh <- payload.Data
+
+				case Piece:
+
+					msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1) // -1 to account for message ID
+					copy(msgData[:], msg.data[5:])
+
+					mngr.SendCh <- messaging.Message{
+						MessageType: messaging.BlockSend,
+						Data:        msgData,
+					}
+
+					reply := <-mngr.RecvCh
+
+					pieceIdx := uint32(6)
+
+					mngr.Mutex.Lock()
+					if reply.MessageType == messaging.PieceValidated {
+						mngr.Bitfield.SetPiece(pieceIdx)
+						peerSendCh <- mngr.generateHaveMsg(pieceIdx)
+					} else if reply.MessageType == messaging.PieceInvalidated {
+						mngr.Bitfield.ZeroPiece(pieceIdx)
+					}
+					mngr.Mutex.Unlock()
 				}
-
-			// Most actions will happen as responses to these 2 message types, as the default case or after the timer
-			case Request:
-
-				if p.IsChoked {
-					return
-				}
-
-				if binary.BigEndian.Uint32(msg.data[13:17]) > piece.BLOCK_SIZE {
-					return
-					//errCh <- fmt.Errorf("peer request has size size %d, expected 16 Kb or smaller", requestedPieceLen)
-				}
-
-				msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1)
-				copy(msgData[:], msg.data[5:])
-
-				mngr.SendCh <- messaging.Message{
-					MessageType: messaging.BlockRequest,
-					Data:        msgData,
-				}
-
-				reply := <-mngr.RecvCh
-
-				payload, ok := reply.Data.(messaging.BlockSendData)
-				if !ok {
-					mngr.ErrorCh <- errors.New("wrong payload type")
-					continue
-				}
-
-				peerSendCh <- payload.Data
-
-			case Piece:
-
-				msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1) // -1 to account for message ID
-				copy(msgData[:], msg.data[5:])
-
-				mngr.SendCh <- messaging.Message{
-					MessageType: messaging.BlockSend,
-					Data:        msgData,
-				}
-
-				reply := <-mngr.RecvCh
-
-				pieceIdx := uint32(6)
-
-				mngr.Mutex.Lock()
-				if reply.MessageType == messaging.PieceValidated {
-					mngr.Bitfield.SetPiece(pieceIdx)
-					peerSendCh <- mngr.generateHaveMsg(pieceIdx)
-				} else if reply.MessageType == messaging.PieceInvalidated {
-					mngr.Bitfield.ZeroPiece(pieceIdx)
-				}
-				mngr.Mutex.Unlock()
-			}
-
-		default:
-			if p.IsInteresting && !p.IsChoking {
-				peerSendCh <- mngr.generateRequestMsg(uint32(0), uint32(0), uint32(0))
 			}
 		}
-	}
+	}()
+
+	p.WaitGroup.Add(1)
+	go func() {
+		// Reply loop
+		p.WaitGroup.Done()
+	}()
+
 }
 
-func (p *Peer) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
+func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
@@ -466,9 +477,9 @@ func (p *Peer) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 			return
 
 		default:
-			p.Conn.SetReadDeadline(time.Now().Add(time.Second * 30))
+			p.PeerConn.SetReadDeadline(time.Now().Add(time.Second * 30))
 
-			n, err := p.Conn.Read(buf)
+			n, err := p.PeerConn.Read(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					log.Printf("reading timed-out, closing connection: %v", err)
@@ -514,7 +525,7 @@ func (p *Peer) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 	}
 }
 
-func (p *Peer) writeLoop(ctx context.Context, recvCh <-chan []byte) {
+func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
@@ -536,9 +547,9 @@ func (p *Peer) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 
 			bytesWritten := 0
 			for bytesWritten < totalLen {
-				p.Conn.SetWriteDeadline(time.Now().Add(time.Second * 15))
+				p.PeerConn.SetWriteDeadline(time.Now().Add(time.Second * 15))
 
-				n, err := p.Conn.Write(msg[bytesWritten:])
+				n, err := p.PeerConn.Write(msg[bytesWritten:])
 				bytesWritten += n
 				if err != nil {
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
@@ -555,7 +566,7 @@ func (p *Peer) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 	}
 }
 
-func (mngr *PeerManager) generateNoPayloadMsg(msgType PeerMessageType) []byte {
+func (mngr *PeerOrchestrator) generateNoPayloadMsg(msgType PeerMessageType) []byte {
 
 	switch msgType {
 	case KeepAlive:
@@ -571,7 +582,7 @@ func (mngr *PeerManager) generateNoPayloadMsg(msgType PeerMessageType) []byte {
 	}
 }
 
-func (mngr *PeerManager) generateHaveMsg(idx uint32) []byte {
+func (mngr *PeerOrchestrator) generateHaveMsg(idx uint32) []byte {
 	buf := make([]byte, 9) // 4 bytes for length prefix, 1 byte for message id and 4 bytes for piece index
 	binary.BigEndian.PutUint32(buf, 5)
 	buf[4] = byte(Have)
@@ -579,7 +590,7 @@ func (mngr *PeerManager) generateHaveMsg(idx uint32) []byte {
 	return buf
 }
 
-func (mngr *PeerManager) generateRequestMsg(idx uint32, offset uint32, len uint32) []byte {
+func (mngr *PeerOrchestrator) generateRequestMsg(idx uint32, offset uint32, len uint32) []byte {
 	buf := make([]byte, 17)
 	binary.BigEndian.PutUint32(buf, 13)
 	buf[4] = byte(Request)
@@ -589,7 +600,7 @@ func (mngr *PeerManager) generateRequestMsg(idx uint32, offset uint32, len uint3
 	return buf
 }
 
-func (mngr *PeerManager) generateBitfieldMsg() []byte {
+func (mngr *PeerOrchestrator) generateBitfieldMsg() []byte {
 	buf := make([]byte, len(mngr.Bitfield)+5)
 	binary.BigEndian.PutUint32(buf, uint32(len(mngr.Bitfield)+1))
 	buf[4] = byte(Bitfield)
@@ -597,28 +608,12 @@ func (mngr *PeerManager) generateBitfieldMsg() []byte {
 	return buf
 }
 
-func (mngr *PeerManager) generatePieceMsg(idx uint32, offset uint32, data []byte) []byte {
+func (mngr *PeerOrchestrator) generatePieceMsg(idx uint32, offset uint32, data []byte) []byte {
 	buf := make([]byte, len(data)+13)
 	binary.BigEndian.PutUint32(buf, uint32(len(data)+9))
 	buf[4] = byte(Piece)
 	copy(buf[5:], data)
 	return buf
-}
-
-func (mngr *PeerManager) getWantedPieces(p *Peer) bitfield.BitfieldMask {
-
-	mngr.Mutex.Lock()
-	defer mngr.Mutex.Unlock()
-
-	WantedPieces := make(bitfield.BitfieldMask, len(mngr.Bitfield))
-	for i := range mngr.Bitfield {
-		WantedPieces[i] = ((mngr.Bitfield[i] ^ p.Bitfield[i]) & p.Bitfield[i])
-	}
-
-	return WantedPieces
-	// Xor gets pieces that the client or the peer have, but not both
-	// And gets pieces the the client has, i.e, that we don't but they have
-
 }
 
 func findFirstNonZeroBit(bytes []byte) int {

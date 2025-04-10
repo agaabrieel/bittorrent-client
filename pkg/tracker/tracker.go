@@ -57,8 +57,8 @@ type AnnounceRequest struct {
 
 type AnnounceResponse struct {
 	tracker  *Tracker
-	interval time.Duration // Seconds to wait between announces
-	peers    []peer.Peer   // List of peers
+	interval time.Duration      // Seconds to wait between announces
+	peers    []peer.PeerManager // List of peers
 	// ... other fields
 }
 
@@ -66,7 +66,7 @@ type Tracker struct {
 	client
 	url      url.URL
 	interval time.Duration
-	peers    []peer.Peer
+	peers    []peer.PeerManager
 	peerMap  map[[20]byte]bool
 }
 
@@ -151,7 +151,7 @@ func (mngr *TrackerManager) setupTracker() {
 			mngr.Tracker.peers = trackerResponse.peers
 
 			for _, p := range mngr.Tracker.peers {
-				mngr.Tracker.peerMap[p.Id] = true
+				mngr.Tracker.peerMap[p.PeerId] = true
 			}
 
 			timer.Stop()
@@ -189,7 +189,7 @@ func (mngr *TrackerManager) setupTracker() {
 				mngr.Tracker.peers = trackerResponse.peers
 
 				for _, p := range mngr.Tracker.peers {
-					mngr.Tracker.peerMap[p.Id] = true
+					mngr.Tracker.peerMap[p.PeerId] = true
 				}
 
 			case <-timer.C:
@@ -257,13 +257,13 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			mngr.Tracker.interval = msg.interval
 
 			for _, peer := range msg.peers {
-				if !mngr.Tracker.peerMap[peer.Id] {
+				if !mngr.Tracker.peerMap[peer.PeerId] {
 					mngr.SendCh <- messaging.Message{
 						MessageType: messaging.NewPeerFromTracker,
 						Data:        peer,
 					}
 					mngr.Tracker.peers = append(mngr.Tracker.peers, peer)
-					mngr.Tracker.peerMap[peer.Id] = true
+					mngr.Tracker.peerMap[peer.PeerId] = true
 				}
 			}
 
@@ -531,16 +531,16 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 	}
 
 	var announceResp AnnounceResponse
-	announceResp.peers = make([]peer.Peer, 0, numPeers)
+	announceResp.peers = make([]peer.PeerManager, 0, numPeers)
 	announceResp.interval = time.Duration(binary.BigEndian.Uint32(announceBuffer[8:12])) * time.Second
 
 	for i := range numPeers {
 		offset := i * 6
 		ip := net.IP(peerData[offset : offset+4])
 		port := binary.BigEndian.Uint16(peerData[offset+4 : offset+6])
-		announceResp.peers = append(announceResp.peers, peer.Peer{
-			Ip:   ip,
-			Port: port,
+		announceResp.peers = append(announceResp.peers, peer.PeerManager{
+			PeerIp:   ip,
+			PeerPort: port,
 		})
 	}
 
@@ -688,16 +688,16 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 					ip := net.ParseIP(string(entry.Value.StringValue[i : i+4]))
 					port := binary.BigEndian.Uint16(entry.Value.StringValue[i+4 : i+6])
 
-					resp.peers = append(resp.peers, peer.Peer{
-						Ip:   ip,
-						Port: port,
+					resp.peers = append(resp.peers, peer.PeerManager{
+						PeerIp:   ip,
+						PeerPort: port,
 					})
 				}
 
 			} else {
 				for _, peerDict := range entry.Value.ListValue {
 
-					var peer peer.Peer
+					var peer peer.PeerManager
 					for _, entry := range peerDict.DictValue {
 
 						k, err := entry.Key.GetStringValue()
@@ -707,13 +707,13 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 
 						switch k {
 						case "peer id":
-							peer.Id = [20]byte(entry.Key.StringValue)
+							peer.PeerId = [20]byte(entry.Key.StringValue)
 							continue
 						case "ip":
-							peer.Ip = net.ParseIP(string(entry.Value.StringValue))
+							peer.PeerIp = net.ParseIP(string(entry.Value.StringValue))
 							continue
 						case "port":
-							peer.Port = uint16(entry.Value.IntegerValue)
+							peer.PeerPort = uint16(entry.Value.IntegerValue)
 							continue
 						}
 					}

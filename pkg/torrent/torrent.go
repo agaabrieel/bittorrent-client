@@ -57,7 +57,7 @@ func (t *SessionManager) Run() {
 
 	TrackerManager := tracker.NewTrackerManager(t.Metainfo, &Router, globalCh, t.Id)
 
-	PeerManager := peer.NewPeerManager(t.Metainfo, &Router, globalCh, t.Id)
+	PeerManager := peer.NewPeerOrchestrator(t.Metainfo, &Router, globalCh, t.Id)
 
 	PieceManager := piece.NewPieceManager(t.Metainfo, &Router, globalCh)
 
@@ -97,8 +97,10 @@ func (t *SessionManager) Run() {
 
 				t.SendCh <- messaging.Message{
 					MessageType: messaging.NewPeerConnection,
-					Data: peer.Peer{
-						Conn: conn,
+					Data: peer.PeerManager{
+						PeerConn:  conn,
+						Mutex:     &sync.Mutex{},
+						WaitGroup: &sync.WaitGroup{},
 					},
 				}
 			}
