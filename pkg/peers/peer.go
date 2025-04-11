@@ -77,6 +77,8 @@ type PeerOrchestrator struct {
 	Waitgroup      sync.WaitGroup
 	SendCh         chan<- messaging.Message
 	RecvCh         <-chan messaging.Message
+	PeerManagerRecvCh  <-chan messaging.Message
+	PeerManagerSendChMap map[[20]byte]chan<- messaging.Message
 	ErrorCh        chan<- error
 }
 
@@ -129,6 +131,10 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 					peerMngr.WaitGroup.Add(1)
 					go peerMngr.replyToPeerHandshake(childCtx, mngr.ErrorCh, mngr.clientInfohash, mngr.clientId)
 				}
+
+			}
+		case msg := <-mngr.PeerManagerCh:
+			switch msg.MessageType {
 
 			}
 		case <-ctx.Done():
@@ -448,8 +454,9 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 	p.WaitGroup.Add(1)
 	go func() {
 		// Reply loop
-		p.WaitGroup.Done()
-	}()
+		defer p.WaitGroup.Done()
+	
+		}()
 
 }
 

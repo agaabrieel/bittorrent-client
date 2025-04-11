@@ -11,7 +11,7 @@ import (
 
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
-	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
+	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 )
 
 const BLOCK_SIZE = 16384                   // 16KB
@@ -19,7 +19,7 @@ const BLOCK_BITFIELD_SIZE = BLOCK_SIZE / 8 // 2048
 
 type PieceManager struct {
 	Metainfo *metainfo.TorrentMetainfoInfoDict
-	Pieces   []Piece
+	Bitfield bitfield.BitfieldMask
 	SendCh   chan<- messaging.Message
 	RecvCh   <-chan messaging.Message
 	ErrCh    chan<- error
@@ -50,12 +50,15 @@ func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalC
 
 	recvCh := make(chan messaging.Message, 256)
 
+	r.Subscribe(messaging.BlockSend, recvCh)
 	r.Subscribe(messaging.BlockRequest, recvCh)
 	r.Subscribe(messaging.AnnounceDataRequest, recvCh)
 
+	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
+
 	return &PieceManager{
 		Metainfo: meta.InfoDict,
-		Pieces:   make([]Piece, int(math.Ceil(float64(meta.InfoDict.Length)/float64(meta.InfoDict.PieceLength)))),
+		Bitfield: make(bitfield.BitfieldMask, bitfieldSize),
 		SendCh:   globalCh,
 		RecvCh:   recvCh,
 		ErrCh:    make(chan error),
@@ -141,7 +144,21 @@ func (mngr *PieceManager) getBlock(data messaging.BlockRequestData) {
 
 	mngr.SendCh <- messaging.Message{
 		MessageType: messaging.BlockSend,
-		Data:        blockData,
+		Data: messaging.BlockSendData{
+			Index:  pieceIndex,
+			Offset: blockOffset,
+			Size:   blockSize,
+			Data:   blockData,
+		},
+	}
+
+	var setBits int
+	for _, byte := range mngr.Bitfield {
+		setBits += bits.OnesCount(uint(byte))
+	}
+
+	if setBits >= int(mngr.Metainfo.Length)/int(mngr.Metainfo.PieceLength) {
+		return
 	}
 
 }
