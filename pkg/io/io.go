@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
@@ -18,6 +19,7 @@ type IOManager struct {
 	SendCh    chan<- messaging.Message
 	RecvCh    <-chan messaging.Message
 	ErrCh     chan<- error
+	Mutex     *sync.Mutex
 }
 
 func NewIOManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan<- messaging.Message, errCh chan<- error) *IOManager {
@@ -47,6 +49,7 @@ func NewIOManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh c
 		RecvCh:    recvCh,
 		SendCh:    globalCh,
 		ErrCh:     errCh,
+		Mutex:     &sync.Mutex{},
 	}
 }
 
@@ -77,16 +80,19 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
+
+					mngr.Mutex.Lock()
+					defer mngr.Mutex.Unlock()
+
 					writtenBytes := int64(0)
 					payloadSize := int64(len(payload.Data))
 					for writtenBytes < payloadSize {
 						n, err := mngr.FD.WriteAt(payload.Data[writtenBytes:], offset+int64(writtenBytes))
-						if err != nil && n == int(payloadSize) {
+						if err != nil && err != io.EOF {
 							mngr.ErrCh <- fmt.Errorf("file writing failed: %v", err)
 							continue
 						}
 						writtenBytes += int64(n)
-
 					}
 				}()
 
