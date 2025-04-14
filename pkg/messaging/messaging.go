@@ -3,6 +3,8 @@ package messaging
 import (
 	"context"
 	"sync"
+
+	uuid "github.com/google/uuid"
 )
 
 // NilMsg
@@ -25,7 +27,22 @@ import (
 
 type Topic string
 
-type Message uint8
+// format source:object:action:destination
+const (
+	PeerMngr_Block_Request_PieceMngr     Topic = "peer_mngr:block:request:piece_mngr"
+	PeerMngr_Block_Send_PieceMngr              = "peer_mngr:block:send:piece_mngr"
+	PieceMngr_Piece_Send_IOMngr                = "piece_mngr:piece:send:io_mngr"
+	PieceMngr_Piece_Request_IOMngr             = "piece_mngr:piece:request:io_mngr"
+	PieceMngr_Block_Request_IOMngr             = "piece_mngr:block:request:io_mngr"
+	TrackerMngr_Peer_Discovered_PeerOrch       = "tracker_mngr:peer:discovered:peer_orch"
+	TorrentMngr_Peer_Connected_PeerOrch        = "torrent_mngr:peer:connected:peer_orch"
+)
+
+type Message struct {
+	ID      uuid.UUID
+	Topic   Topic
+	Payload any
+}
 
 type BlockRequestData struct {
 	Index  uint32
