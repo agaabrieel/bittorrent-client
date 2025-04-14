@@ -23,36 +23,9 @@ import (
 // BlockSend
 // Data = uint32 piece index, uint32 block offset, uint32 block length
 
-type MessageActor uint8
-type MessageObject uint8
-type MessageAction uint8
+type Topic string
 
-const (
-	PeerManager MessageActor = iota
-	PieceManager
-	IOManager
-	PeerOrchestrator
-	TrackerManager
-)
-
-const (
-	Piece MessageObject = iota
-	Block
-	Peer
-)
-
-const (
-	Request MessageAction = iota
-	Send
-)
-
-type Message struct {
-	Source      MessageActor
-	Destination MessageActor
-	Object      MessageObject
-	Action      MessageAction
-	Data        any
-}
+type Message uint8
 
 type BlockRequestData struct {
 	Index  uint32
@@ -89,12 +62,14 @@ type AnnounceDataResponseData struct {
 }
 
 type Router struct {
-	Subscribers map[MessageActor]map[MessageObject]map[MessageAction]map[MessageActor]chan<- Message
+	Subscribers map[Topic][]chan<- Message
 	Mutex       *sync.RWMutex
 }
 
-func (r *Router) Subscribe(source MessageActor, obj MessageObject, action MessageAction, destination MessageActor, ch chan<- Message) {
-	r.Subscribers[source][obj][action][destination] = ch
+func (r *Router) Subscribe(topic Topic, ch chan Message) {
+	r.Mutex.Lock()
+	r.Subscribers[topic] = append(r.Subscribers[topic], ch)
+	r.Mutex.Unlock()
 }
 
 func (r *Router) Run(commCh chan Message, ctx context.Context) {
