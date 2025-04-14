@@ -39,8 +39,6 @@ func NewTorrentSession(filepath string) (*SessionManager, error) {
 	return &SessionManager{
 		Id:        id,
 		Port:      6081,
-		SendCh:    make(chan messaging.Message, 256),
-		RecvCh:    make(chan messaging.Message, 256),
 		Mutex:     sync.Mutex{},
 		WaitGroup: sync.WaitGroup{},
 	}, nil
@@ -51,13 +49,20 @@ func (t *SessionManager) Run() {
 
 	Router := messaging.Router{
 		Subscribers: make(map[messaging.MessageType][]chan<- messaging.Message),
+		Mutex:       &sync.RWMutex{},
 	}
 
-	globalCh := make(chan messaging.Message)
+	globalCh := make(chan messaging.Message, 256)
+	sessionRecvCh := make(chan messaging.Message, 256)
+
+	Router.Subscribe(messaging.FileFinished, sessionRecvCh)
+
+	t.SendCh = globalCh
+	t.RecvCh = sessionRecvCh
 
 	TrackerManager := tracker.NewTrackerManager(t.Metainfo, &Router, globalCh, t.Id)
 
-	PeerManager := peer.NewPeerOrchestrator(t.Metainfo, &Router, globalCh, t.Id)
+	PeerOrchestrator := peer.NewPeerOrchestrator(t.Metainfo, &Router, globalCh, t.Id)
 
 	PieceManager := piece.NewPieceManager(t.Metainfo, &Router, globalCh)
 
@@ -66,9 +71,9 @@ func (t *SessionManager) Run() {
 	t.WaitGroup.Add(4)
 	defer t.WaitGroup.Wait()
 
-	go Router.Start(globalCh)
+	go Router.Start(globalCh, ctx)
 	go TrackerManager.Run(ctx, &t.WaitGroup)
-	go PeerManager.Run(ctx, &t.WaitGroup)
+	go PeerOrchestrator.Run(ctx, &t.WaitGroup)
 	go PieceManager.Run(ctx, &t.WaitGroup)
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(t.Port)))
@@ -95,14 +100,12 @@ func (t *SessionManager) Run() {
 					continue
 				}
 
+				peerMngr := peer.NewPeerManager(&Router, globalCh, conn)
 				t.SendCh <- messaging.Message{
 					MessageType: messaging.NewPeerConnection,
-					Data: peer.PeerManager{
-						PeerConn:  conn,
-						Mutex:     &sync.Mutex{},
-						WaitGroup: &sync.WaitGroup{},
-					},
+					Data:        peerMngr,
 				}
+
 			}
 		}
 	}()

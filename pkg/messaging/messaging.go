@@ -1,5 +1,10 @@
 package messaging
 
+import (
+	"context"
+	"sync"
+)
+
 // NilMsg
 // Data = nil
 
@@ -24,6 +29,7 @@ const (
 	BlockRequest MessageType = iota
 	BlockSend
 	PieceSend
+	PieceRequest
 	NewPeerFromTracker
 	NewPeerConnection
 	PeerUpdate
@@ -33,11 +39,17 @@ const (
 	PieceValidated
 	PieceInvalidated
 	FileFinished
+	Error
 )
 
 type Message struct {
 	MessageType MessageType
 	Data        any
+}
+
+type PeerManagerMessage struct {
+	Message Message
+	Id      [20]byte
 }
 
 type BlockRequestData struct {
@@ -53,6 +65,17 @@ type BlockSendData struct {
 	Data   []byte
 }
 
+type PieceSendData struct {
+	Index uint32
+	Size  uint32
+	Data  []byte
+}
+
+type PieceRequestData struct {
+	Index uint32
+	Size  uint32
+}
+
 type AnnounceDataRequestData struct {
 }
 
@@ -63,21 +86,25 @@ type AnnounceDataResponseData struct {
 	Event      string
 }
 
-type PeerSendData struct {
-}
-
 type Router struct {
 	Subscribers map[MessageType][]chan<- Message
+	Mutex       *sync.RWMutex
 }
 
 func (r *Router) Subscribe(msgType MessageType, ch chan<- Message) {
 	r.Subscribers[msgType] = append(r.Subscribers[msgType], ch)
 }
 
-func (r *Router) Start(commCh chan Message) {
-	for msg := range commCh {
-		for _, ch := range r.Subscribers[msg.MessageType] {
-			ch <- msg
+func (r *Router) Start(commCh chan Message, ctx context.Context) {
+
+	select {
+	case <-ctx.Done():
+		return
+	default:
+		for msg := range commCh {
+			for _, ch := range r.Subscribers[msg.MessageType] {
+				ch <- msg
+			}
 		}
 	}
 }

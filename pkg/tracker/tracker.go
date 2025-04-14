@@ -86,6 +86,9 @@ type TrackerManager struct {
 
 func NewTrackerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, ourId [20]byte) *TrackerManager {
 
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
+
 	recvCh := make(chan messaging.Message, 256)
 
 	r.Subscribe(messaging.AnnounceDataResponse, recvCh)

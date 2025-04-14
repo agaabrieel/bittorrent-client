@@ -48,6 +48,9 @@ type Piece struct {
 
 func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message) *PieceManager {
 
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
+
 	recvCh := make(chan messaging.Message, 256)
 
 	r.Subscribe(messaging.BlockSend, recvCh)
@@ -95,6 +98,8 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 		case <-ctx.Done():
 			continue
+		default:
+
 		}
 	}
 }

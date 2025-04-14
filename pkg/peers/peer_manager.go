@@ -16,7 +16,6 @@ import (
 
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
-	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	piece "github.com/agaabrieel/bittorrent-client/pkg/piece"
 )
 
@@ -35,8 +34,8 @@ const (
 	Piece
 	Cancel
 	Port              // DHT
-	KeepAlive         // NOT PROTOCOL-COMPLIANT
-	HandshakeResponse // NOT PROTOCOL-COMPLIANT
+	KeepAlive         // NOT PROTOCOL-COMPLIANT, FOR INTERNAL USE ONLY
+	HandshakeResponse // NOT PROTOCOL-COMPLIANT, FOR INTERNAL USE ONLY
 )
 
 type PeerMessage struct {
@@ -58,89 +57,29 @@ type PeerManager struct {
 	LastActive      time.Time
 	LastMessage     PeerMessage
 	WaitGroup       *sync.WaitGroup
-	Mutex           *sync.Mutex
-	OrchestratorSendCh chan int
-	OrchestratorRecvCh chan int
+	Mutex           *sync.RWMutex
+	SendCh          chan<- messaging.Message
+	RecvCh          <-chan messaging.Message
+	ErrCh           chan<- error
 }
 
-type PeerConnection struct {
-	net.Conn
-}
+func NewPeerManager(r *messaging.Router, globalCh chan<- messaging.Message, conn net.Conn) *PeerManager {
 
-type PeerOrchestrator struct {
-	clientId       [20]byte
-	clientInfohash [20]byte
-	AskedBlocks    []piece.Block
-	Bitfield       bitfield.BitfieldMask
-	Peers          []PeerManager
-	Mutex          sync.RWMutex
-	Waitgroup      sync.WaitGroup
-	SendCh         chan<- messaging.Message
-	RecvCh         <-chan messaging.Message
-	PeerManagerRecvCh  <-chan messaging.Message
-	PeerManagerSendChMap map[[20]byte]chan<- messaging.Message
-	ErrorCh        chan<- error
-}
-
-func NewPeerOrchestrator(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, id [20]byte) *PeerOrchestrator {
+	r.Mutex.Lock()
+	defer r.Mutex.Unlock()
 
 	recvCh := make(chan messaging.Message, 256)
 
-	r.Subscribe(messaging.NewPeerFromTracker, recvCh)
-	r.Subscribe(messaging.PeerUpdate, recvCh)
 	r.Subscribe(messaging.BlockSend, recvCh)
-	r.Subscribe(messaging.PieceInvalidated, recvCh)
 	r.Subscribe(messaging.PieceValidated, recvCh)
-	r.Subscribe(messaging.FileFinished, recvCh)
+	r.Subscribe(messaging.PieceInvalidated, recvCh)
 
-	return &PeerOrchestrator{
-		Peers:          make([]PeerManager, 100),
-		clientId:       id,
-		clientInfohash: meta.Infohash,
-		Bitfield:       bitfield.NewBitfield(uint32(float64((meta.InfoDict.Length / meta.InfoDict.PieceLength) / 8))),
-		ErrorCh:        make(chan error, 256),
-		RecvCh:         recvCh,
-		SendCh:         globalCh,
-		Mutex:          sync.RWMutex{},
-		Waitgroup:      sync.WaitGroup{},
-	}
-}
-
-func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
-
-	defer wg.Done()
-	childCtx, ctxCancel := context.WithCancel(ctx)
-
-	for {
-		select {
-		case msg := <-mngr.RecvCh:
-			switch msg.MessageType {
-			case messaging.NewPeerFromTracker, messaging.NewPeerConnection:
-
-				peerMngr, ok := msg.Data.(PeerManager)
-				if !ok {
-					mngr.ErrorCh <- errors.New("payload has incorrect type")
-					ctxCancel()
-				}
-
-				wg.Add(1)
-				if msg.MessageType == messaging.NewPeerFromTracker {
-					peerMngr.WaitGroup.Add(1)
-					go peerMngr.startPeerHandshake(childCtx, mngr.ErrorCh, mngr.clientInfohash, mngr.clientId)
-				} else {
-					peerMngr.WaitGroup.Add(1)
-					go peerMngr.replyToPeerHandshake(childCtx, mngr.ErrorCh, mngr.clientInfohash, mngr.clientId)
-				}
-
-			}
-		case msg := <-mngr.PeerManagerCh:
-			switch msg.MessageType {
-
-			}
-		case <-ctx.Done():
-			ctxCancel()
-			return // should add logging here
-		}
+	return &PeerManager{
+		PeerConn:  conn,
+		Mutex:     &sync.RWMutex{},
+		WaitGroup: &sync.WaitGroup{},
+		RecvCh:    recvCh,
+		SendCh:    globalCh,
 	}
 }
 
@@ -325,7 +264,6 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 	peerRecvCh := make(chan PeerMessage, 1024)
 	peerSendCh := make(chan []byte, 1024)
-	peerMsgCh := make(chan PeerMessage, 1024)
 
 	// Writer loop
 	p.WaitGroup.Add(1)
@@ -351,102 +289,92 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 				return
 
 			case msg := <-peerRecvCh:
-				p.LastMessage = msg
-				p.LastActive = time.Now()
-				switch msg.messageType {
+				go func() {
+					p.LastMessage = msg
+					p.LastActive = time.Now()
 
-				// First 6 cases simply update the internal peer status
-				case Choke:
-					p.IsChoking = true
+					p.Mutex.Lock()
+					defer p.Mutex.Unlock()
+					switch msg.messageType {
 
-				case Unchoke:
-					p.IsChoking = false
+					// First 6 cases simply update the internal peer status
+					case Choke:
+						p.IsChoking = true
 
-				case NotInterested:
-					p.IsInterested = false
+					case Unchoke:
+						p.IsChoking = false
 
-				case Interested:
-					p.IsInterested = true
+					case NotInterested:
+						p.IsInterested = false
 
-				case Bitfield:
-					p.PeerBitfield = msg.data
-					wantedPieces := p.PeerBitfield.
+					case Interested:
+						p.IsInterested = true
 
-					if len(wantedPieces) != 0 {
-						if !p.IsInteresting {
-							p.IsInteresting = true
+					case Bitfield:
+						p.PeerBitfield = msg.data
+						wantedPieces := p.PeerBitfield
+
+						if len(wantedPieces) != 0 {
+							if !p.IsInteresting {
+								peerSendCh <- generateNoPayloadMsg(Interested)
+								p.IsInteresting = true
+							}
+						} else if p.IsInteresting {
+							peerSendCh <- generateNoPayloadMsg(NotInterested)
+							p.IsInteresting = false
 						}
-					} else if p.IsInteresting {
-						p.IsInteresting = false
-					}
 
-				case Have:
-					p.PeerBitfield.SetPiece(binary.BigEndian.Uint32(msg.data[5:]))
-					wantedPieces := mngr.getWantedPieces(p)
+					case Have:
+						p.PeerBitfield.SetPiece(binary.BigEndian.Uint32(msg.data[5:]))
+						wantedPieces := 1
 
-					if wantedPieces != nil {
-						if !p.IsInteresting {
-							peerSendCh <- mngr.generateNoPayloadMsg(Interested)
-							p.IsInteresting = true
+						if wantedPieces != 0 {
+							if !p.IsInteresting {
+								peerSendCh <- generateNoPayloadMsg(Interested)
+								p.IsInteresting = true
+							}
+						} else if p.IsInteresting {
+							peerSendCh <- generateNoPayloadMsg(NotInterested)
+							p.IsInteresting = false
 						}
-					} else if p.IsInteresting {
-						peerSendCh <- mngr.generateNoPayloadMsg(NotInterested)
-						p.IsInteresting = false
+
+					case Request:
+
+						if p.IsChoked {
+							p.SendCh <- messaging.Message{
+								MessageType: messaging.Error,
+								Data:        errors.New("peer sent request while being choked"),
+							}
+							return
+						}
+
+						if binary.BigEndian.Uint32(msg.data[13:17]) > piece.BLOCK_SIZE {
+							p.SendCh <- messaging.Message{
+								MessageType: messaging.Error,
+								Data:        fmt.Errorf("peer request has size %d, expected 16 Kb or smaller", binary.BigEndian.Uint32(msg.data[13:17])),
+							}
+							return
+						}
+
+						msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1)
+						copy(msgData[:], msg.data[5:])
+
+						p.SendCh <- messaging.Message{
+							MessageType: messaging.BlockRequest,
+							Data:        msgData,
+						}
+
+					case Piece:
+
+						msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1) // -1 to account for message ID
+						copy(msgData[:], msg.data[5:])
+
+						p.SendCh <- messaging.Message{
+							MessageType: messaging.BlockSend,
+							Data:        msgData,
+						}
 					}
-
-				// Most actions will happen as responses to these 2 message types, as the default case or after the timer
-				case Request:
-
-					if p.IsChoked {
-						return
-					}
-
-					if binary.BigEndian.Uint32(msg.data[13:17]) > piece.BLOCK_SIZE {
-						return
-						//errCh <- fmt.Errorf("peer request has size size %d, expected 16 Kb or smaller", requestedPieceLen)
-					}
-
-					msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1)
-					copy(msgData[:], msg.data[5:])
-
-					mngr.SendCh <- messaging.Message{
-						MessageType: messaging.BlockRequest,
-						Data:        msgData,
-					}
-
-					reply := <-mngr.RecvCh
-
-					payload, ok := reply.Data.(messaging.BlockSendData)
-					if !ok {
-						mngr.ErrorCh <- errors.New("wrong payload type")
-						continue
-					}
-
-					peerSendCh <- payload.Data
-
-				case Piece:
-
-					msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1) // -1 to account for message ID
-					copy(msgData[:], msg.data[5:])
-
-					mngr.SendCh <- messaging.Message{
-						MessageType: messaging.BlockSend,
-						Data:        msgData,
-					}
-
-					reply := <-mngr.RecvCh
-
-					pieceIdx := uint32(6)
-
-					mngr.Mutex.Lock()
-					if reply.MessageType == messaging.PieceValidated {
-						mngr.Bitfield.SetPiece(pieceIdx)
-						peerSendCh <- mngr.generateHaveMsg(pieceIdx)
-					} else if reply.MessageType == messaging.PieceInvalidated {
-						mngr.Bitfield.ZeroPiece(pieceIdx)
-					}
-					mngr.Mutex.Unlock()
-				}
+				}()
 			}
 		}
 	}()
@@ -455,8 +383,32 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 	go func() {
 		// Reply loop
 		defer p.WaitGroup.Done()
-	
-		}()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case msg := <-p.RecvCh:
+				go func() {
+					switch msg.MessageType {
+					case messaging.BlockSend:
+
+						data, ok := msg.Data.(messaging.BlockSendData)
+						if !ok {
+							p.SendCh <- messaging.Message{
+								MessageType: messaging.Error,
+								Data:        errors.New("invalid payload type"),
+							}
+							return
+						}
+
+						peerSendCh <- data.Data
+
+					}
+				}()
+			}
+		}
+
+	}()
 
 }
 
@@ -573,7 +525,7 @@ func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 	}
 }
 
-func (mngr *PeerOrchestrator) generateNoPayloadMsg(msgType PeerMessageType) []byte {
+func generateNoPayloadMsg(msgType PeerMessageType) []byte {
 
 	switch msgType {
 	case KeepAlive:
@@ -589,7 +541,7 @@ func (mngr *PeerOrchestrator) generateNoPayloadMsg(msgType PeerMessageType) []by
 	}
 }
 
-func (mngr *PeerOrchestrator) generateHaveMsg(idx uint32) []byte {
+func generateHaveMsg(idx uint32) []byte {
 	buf := make([]byte, 9) // 4 bytes for length prefix, 1 byte for message id and 4 bytes for piece index
 	binary.BigEndian.PutUint32(buf, 5)
 	buf[4] = byte(Have)
@@ -597,7 +549,7 @@ func (mngr *PeerOrchestrator) generateHaveMsg(idx uint32) []byte {
 	return buf
 }
 
-func (mngr *PeerOrchestrator) generateRequestMsg(idx uint32, offset uint32, len uint32) []byte {
+func generateRequestMsg(idx uint32, offset uint32, len uint32) []byte {
 	buf := make([]byte, 17)
 	binary.BigEndian.PutUint32(buf, 13)
 	buf[4] = byte(Request)
@@ -607,15 +559,15 @@ func (mngr *PeerOrchestrator) generateRequestMsg(idx uint32, offset uint32, len 
 	return buf
 }
 
-func (mngr *PeerOrchestrator) generateBitfieldMsg() []byte {
-	buf := make([]byte, len(mngr.Bitfield)+5)
-	binary.BigEndian.PutUint32(buf, uint32(len(mngr.Bitfield)+1))
+func generateBitfieldMsg(bf bitfield.BitfieldMask) []byte {
+	buf := make([]byte, len(bf)+5)
+	binary.BigEndian.PutUint32(buf, uint32(len(bf)+1))
 	buf[4] = byte(Bitfield)
-	copy(buf[5:], mngr.Bitfield)
+	copy(buf[5:], bf)
 	return buf
 }
 
-func (mngr *PeerOrchestrator) generatePieceMsg(idx uint32, offset uint32, data []byte) []byte {
+func generatePieceMsg(idx uint32, offset uint32, data []byte) []byte {
 	buf := make([]byte, len(data)+13)
 	binary.BigEndian.PutUint32(buf, uint32(len(data)+9))
 	buf[4] = byte(Piece)
