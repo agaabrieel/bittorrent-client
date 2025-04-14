@@ -23,33 +23,35 @@ import (
 // BlockSend
 // Data = uint32 piece index, uint32 block offset, uint32 block length
 
-type MessageType uint8
+type MessageActor uint8
+type MessageObject uint8
+type MessageAction uint8
 
 const (
-	BlockRequest MessageType = iota
-	BlockSend
-	PieceSend
-	PieceRequest
-	NewPeerFromTracker
-	NewPeerConnection
-	PeerUpdate
-	AnnounceDataRequest
-	AnnounceDataResponse
-	TrackerData
-	PieceValidated
-	PieceInvalidated
-	FileFinished
-	Error
+	PeerManager MessageActor = iota
+	PieceManager
+	IOManager
+	PeerOrchestrator
+	TrackerManager
+)
+
+const (
+	Piece MessageObject = iota
+	Block
+	Peer
+)
+
+const (
+	Request MessageAction = iota
+	Send
 )
 
 type Message struct {
-	MessageType MessageType
+	Source      MessageActor
+	Destination MessageActor
+	Object      MessageObject
+	Action      MessageAction
 	Data        any
-}
-
-type PeerManagerMessage struct {
-	Message Message
-	Id      [20]byte
 }
 
 type BlockRequestData struct {
@@ -87,24 +89,21 @@ type AnnounceDataResponseData struct {
 }
 
 type Router struct {
-	Subscribers map[MessageType][]chan<- Message
+	Subscribers map[MessageActor]map[MessageObject]map[MessageAction]map[MessageActor]chan<- Message
 	Mutex       *sync.RWMutex
 }
 
-func (r *Router) Subscribe(msgType MessageType, ch chan<- Message) {
-	r.Subscribers[msgType] = append(r.Subscribers[msgType], ch)
+func (r *Router) Subscribe(source MessageActor, obj MessageObject, action MessageAction, destination MessageActor, ch chan<- Message) {
+	r.Subscribers[source][obj][action][destination] = ch
 }
 
-func (r *Router) Start(commCh chan Message, ctx context.Context) {
-
+func (r *Router) Run(commCh chan Message, ctx context.Context) {
 	select {
 	case <-ctx.Done():
 		return
 	default:
 		for msg := range commCh {
-			for _, ch := range r.Subscribers[msg.MessageType] {
-				ch <- msg
-			}
+			r.Subscribers[msg.Source][msg.Object][msg.Action][msg.Destination] <- msg
 		}
 	}
 }

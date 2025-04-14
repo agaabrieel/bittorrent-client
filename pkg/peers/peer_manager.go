@@ -361,7 +361,11 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 						p.SendCh <- messaging.Message{
 							MessageType: messaging.BlockRequest,
-							Data:        msgData,
+							Data: messaging.BlockRequestData{
+								Index:  binary.BigEndian.Uint32(msg.data[0:4]),
+								Offset: binary.BigEndian.Uint32(msg.data[4:8]),
+								Size:   binary.BigEndian.Uint32(msg.data[8:12]),
+							},
 						}
 
 					case Piece:
