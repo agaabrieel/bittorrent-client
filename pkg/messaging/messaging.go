@@ -1,54 +1,11 @@
 package messaging
 
 import (
-	"context"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
-)
-
-// NilMsg
-// Data = nil
-
-// PieceValidated
-// Data = uint32 piece index
-
-// PieceInvalidated
-// Data = uint32 piece index
-
-// FileFinished
-// Data = ?
-
-// BlockRequest
-// Data = uint32 piece index, uint32 block offset, uint32 block length
-
-// BlockSend
-// Data = uint32 piece index, uint32 block offset, uint32 block length
-
-// interesting approach, but possibly over engineered for <10 components in the architecture
-// format source:object:action:destination
-type Topic string
-
-const (
-	PeerMngr_Block_Request_PieceMngr     Topic = "peer_mngr:block:request:piece_mngr"
-	PeerMngr_Block_Send_PieceMngr        Topic = "peer_mngr:block:send:piece_mngr"
-	PieceMngr_Piece_Send_IOMngr          Topic = "piece_mngr:piece:send:io_mngr"
-	PieceMngr_Piece_Request_IOMngr       Topic = "piece_mngr:piece:request:io_mngr"
-	PieceMngr_Block_Request_IOMngr       Topic = "piece_mngr:block:request:io_mngr"
-	TrackerMngr_Peer_Discovered_PeerOrch Topic = "tracker_mngr:peer:discovered:peer_orch"
-	TorrentMngr_Peer_Connected_PeerOrch  Topic = "torrent_mngr:peer:connected:peer_orch"
-)
-
-// ------------------------------------------------------------------------------------------//
-type ComponentID uint8
-
-const (
-	PeerManager ComponentID = iota
-	PeerOrchestrator
-	PieceManager
-	IOManager
-	TrackerManager
 )
 
 type MessageType uint8
@@ -66,10 +23,10 @@ const (
 
 type Message struct {
 	ID          uuid.UUID
-	Type        MessageType
+	PayloadType MessageType
+	Topic       string
 	Payload     any
-	Source      ComponentID
-	Destination ComponentID
+	ReplyCh     chan<- Message
 	CreatedAt   time.Time
 }
 
@@ -108,36 +65,43 @@ type AnnounceDataResponseData struct {
 }
 
 type Router struct {
-	Shards map[ComponentID]*Shard
+	Subscribers map[string][]chan<- Message
+	mu          *sync.RWMutex
 }
 
-type Shard struct {
-	Subscribers map[ComponentID]chan Message
-	Mutex       *sync.RWMutex
-	commCh      chan Message
+func (r *Router) Subscribe(topic string, ch chan<- Message) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.Subscribers[topic] = append(r.Subscribers[topic], ch)
 }
 
-func (r *Router) Subscribe(srcId, destId ComponentID) {
-	r.Shards[id].Subscribers[id]
-}
+func (r *Router) Publish(msg Message) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
-func (r *Router) Publish() {
-
-}
-
-func (r *Router) Run(globalCh chan Message, ctx context.Context) {
-
-	r.Mutex.RLock()
-	defer r.Mutex.RUnlock()
-
-	select {
-	case <-ctx.Done():
-		return
-	case msg := <-globalCh:
-		if r.Subscribers[msg.Destination] != nil {
-			r.Subscribers[msg.Destination] <- msg
+	for topic, chans := range r.Subscribers {
+		if matchTopic(topic, msg.Topic) {
+			for _, ch := range chans {
+				ch <- msg
+			}
 		}
-	default:
-		// log, etc
 	}
+}
+
+func matchTopic(pattern, topic string) bool {
+	pattern_segments := strings.Split(pattern, ".")
+	topic_segments := strings.Split(topic, ".")
+
+	if len(pattern_segments) != len(topic_segments) {
+		return false
+	}
+
+	for idx, pattern_segment := range pattern_segments {
+		if pattern_segment == "*" || pattern_segment == topic_segments[idx] {
+			continue // continues to next segment if segments match or if pattern contains a wildcard
+		} else {
+			return false
+		}
+	}
+	return true
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"errors"
+	"fmt"
 	"math"
 	"math/bits"
 	"math/rand"
@@ -48,14 +49,11 @@ type Piece struct {
 
 func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message) *PieceManager {
 
-	r.Mutex.Lock()
-	defer r.Mutex.Unlock()
-
 	recvCh := make(chan messaging.Message, 256)
 
-	r.Subscribe(messaging.BlockSend, recvCh)
-	r.Subscribe(messaging.BlockRequest, recvCh)
-	r.Subscribe(messaging.AnnounceDataRequest, recvCh)
+	r.Subscribe(fmt.Sprintf("tracker_manager.peer.discovered.peer_manager_%s"), recvCh)
+	r.Subscribe("", recvCh)
+	r.Subscribe("", recvCh)
 
 	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
 
