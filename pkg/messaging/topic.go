@@ -1,7 +1,11 @@
 package messaging
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
+// interesting idea but possibly overkill
 // message topics follow the format source.object.action.destination
 // wildcard * for any individual segment
 
@@ -36,4 +40,22 @@ const (
 
 func newTopic(source Actor, obj Object, action Action, destination Actor) string {
 	return fmt.Sprintf("%s.%s.%s.%s", source, obj, action, destination)
+}
+
+func matchTopic(pattern, topic string) bool {
+	pattern_segments := strings.Split(pattern, ".")
+	topic_segments := strings.Split(topic, ".")
+
+	if len(pattern_segments) != len(topic_segments) {
+		return false
+	}
+
+	for idx, pattern_segment := range pattern_segments {
+		if pattern_segment == "*" || pattern_segment == topic_segments[idx] {
+			continue // continues to next segment if segments match or if pattern contains a wildcard
+		} else {
+			return false
+		}
+	}
+	return true
 }
