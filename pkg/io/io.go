@@ -2,11 +2,11 @@ package io
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
@@ -15,38 +15,42 @@ import (
 type IOManager struct {
 	id        string
 	FD        *os.File
+	Router    *messaging.Router
 	FileSize  int64
 	PieceSize int64
-	RecvCh    <-chan messaging.DirectedMessage
+	RecvCh    <-chan messaging.Message
 	mu        *sync.RWMutex
 	wg        *sync.WaitGroup
 }
 
-func NewIOManager(meta metainfo.TorrentMetainfo, r *messaging.Router) *IOManager {
+func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router) (*IOManager, error) {
 
-	id, ch := r.NewComponent()
+	id, ch := "io_manager", make(chan messaging.Message, 1024)
+	err := r.RegisterComponent(id, ch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register component: %v", err)
+	}
 
 	fd, err := os.Create(meta.InfoDict.Name)
 	if err != nil {
-		errCh <- fmt.Errorf("file creation failed: %v", err)
-		return nil
+		return nil, fmt.Errorf("file creation failed: %v", err)
 	}
 
 	err = fd.Truncate(int64(meta.InfoDict.Length))
 	if err != nil {
-		errCh <- fmt.Errorf("failed to allocate enough size for the file: %v", err)
-		return nil
+		return nil, fmt.Errorf("failed to allocate enough size for the file: %v", err)
 	}
 
 	return &IOManager{
 		id:        id,
 		FD:        fd,
+		Router:    r,
 		PieceSize: int64(meta.InfoDict.PieceLength),
 		FileSize:  int64(meta.InfoDict.Length),
 		RecvCh:    ch,
 		mu:        &sync.RWMutex{},
 		wg:        &sync.WaitGroup{},
-	}
+	}, nil
 }
 
 func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
@@ -58,7 +62,7 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
-			switch msg.MessageType {
+			switch msg.PayloadType {
 			case messaging.PieceSend:
 
 				wg.Add(1)
@@ -66,28 +70,53 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 					defer wg.Done()
 
-					mngr.Mutex.Lock()
-					defer mngr.Mutex.Unlock()
+					mngr.mu.Lock()
+					defer mngr.mu.Unlock()
 
-					payload, ok := msg.Data.(messaging.PieceSendData)
+					payload, ok := msg.Payload.(messaging.PieceSendPayload)
 					if !ok {
-						mngr.ErrCh <- errors.New("wrong data type")
+						mngr.Router.Send("", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Msg: "type validation failed",
+							},
+							CreatedAt: time.Now(),
+						})
 						return
 					}
 
 					offset, err := mngr.FD.Seek(int64(payload.Index)*mngr.FileSize, 0)
 					if err != nil {
-						mngr.ErrCh <- fmt.Errorf("file seek failed: %v", err)
+
+						mngr.Router.Send("", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Msg: fmt.Sprintf("file seek failed: %v", err),
+							},
+							CreatedAt: time.Now(),
+						})
 						return
 					}
 
 					writtenBytes := int64(0)
 					payloadSize := int64(len(payload.Data))
 					for writtenBytes < payloadSize {
+
 						n, err := mngr.FD.WriteAt(payload.Data[writtenBytes:], offset+int64(writtenBytes))
+
 						if err != nil && err != io.EOF {
-							mngr.ErrCh <- fmt.Errorf("file writing failed: %v", err)
-							continue
+
+							mngr.Router.Send("", messaging.Message{
+								SourceId:    mngr.id,
+								PayloadType: messaging.Error,
+								Payload: messaging.ErrorPayload{
+									Msg: fmt.Sprintf("file writing failed: %v", err),
+								},
+								CreatedAt: time.Now(),
+							})
+							return
 						}
 						writtenBytes += int64(n)
 					}
@@ -100,12 +129,19 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 					defer wg.Done()
 
-					mngr.Mutex.RLock()
-					defer mngr.Mutex.RUnlock()
+					mngr.mu.RLock()
+					defer mngr.mu.RUnlock()
 
-					payload, ok := msg.Data.(messaging.BlockRequestData)
+					payload, ok := msg.Payload.(messaging.BlockRequestPayload)
 					if !ok {
-						mngr.ErrCh <- errors.New("wrong data type")
+						mngr.Router.Send("", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Msg: "type validation failed",
+							},
+							CreatedAt: time.Now(),
+						})
 						return
 					}
 
@@ -113,7 +149,14 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 					offset, err := mngr.FD.Seek(int64(payload.Index)*mngr.FileSize+int64(payload.Offset), 0)
 					if err != nil {
-						mngr.ErrCh <- fmt.Errorf("file seek failed: %v", err)
+						mngr.Router.Send("", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Msg: fmt.Sprintf("file seek failed: %v", err),
+							},
+							CreatedAt: time.Now(),
+						})
 						return
 					}
 
@@ -121,26 +164,32 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					for writtenBytes < int64(payload.Size) {
 						n, err := mngr.FD.ReadAt(buffer[writtenBytes:], offset+int64(writtenBytes))
 						if err != nil && err != io.EOF {
-							mngr.ErrCh <- fmt.Errorf("file reading failed: %v", err)
-							continue
+							mngr.Router.Send("", messaging.Message{
+								SourceId:    mngr.id,
+								PayloadType: messaging.Error,
+								Payload: messaging.ErrorPayload{
+									Msg: fmt.Sprintf("file write failed: %v", err),
+								},
+								CreatedAt: time.Now(),
+							})
+							return
 						}
 						writtenBytes += int64(n)
 					}
 
-					mngr.SendCh <- messaging.DirectedMessage{
-						MessageType: messaging.BlockSend,
-						Data: messaging.BlockSendData{
+					mngr.Router.Send(msg.SourceId, messaging.Message{
+						SourceId:    mngr.id,
+						PayloadType: messaging.BlockSend,
+						Payload: messaging.BlockSendPayload{
 							Index:  payload.Index,
-							Offset: uint32(offset),
+							Offset: payload.Offset,
 							Size:   payload.Size,
 							Data:   buffer,
 						},
-					}
+						CreatedAt: time.Now(),
+					})
 
 				}()
-
-			case messaging.FileFinished:
-				// even more stuff to do
 			}
 		case <-ctx.Done():
 			cancel()

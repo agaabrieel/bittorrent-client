@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"sync"
 	"time"
@@ -20,17 +21,19 @@ import (
 
 type SessionManager struct {
 	id               string
+	Logger           *log.Logger
 	Router           *messaging.Router
 	ClientId         [20]byte
 	Port             int
-	Metainfo         metainfo.TorrentMetainfo
-	RecvCh           <-chan messaging.DirectedMessage
+	Metainfo         *metainfo.TorrentMetainfo
+	RecvCh           <-chan messaging.Message
+	ErrCh            chan error
 	wg               *sync.WaitGroup
 	mu               *sync.Mutex
 	coreComponentIds []string
 }
 
-func NewTorrentSessionManager(filepath string, r *messaging.Router) (*SessionManager, error) {
+func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, error) {
 
 	meta := metainfo.NewMetainfo()
 	if err := meta.Deserialize(filepath); err != nil {
@@ -40,13 +43,27 @@ func NewTorrentSessionManager(filepath string, r *messaging.Router) (*SessionMan
 	var clientId [20]byte
 	rand.Read(clientId[:])
 
-	id, ch := r.NewComponent()
+	id, ch := "session_manager", make(chan messaging.Message, 1024)
+
+	logFile, err := os.Create(fmt.Sprintf("%s-%s", id, meta.Infohash))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create log file: %v", err)
+	}
+	logger := log.New(logFile, logFile.Name(), 10111)
+
+	err = r.RegisterComponent(id, ch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register component with id %s: %v", id, err)
+	}
 
 	return &SessionManager{
 		id:       id,
-		Router:   messaging.NewRouter(),
+		Router:   messaging.NewRouter(logger),
+		Logger:   logger,
 		ClientId: clientId,
+		Metainfo: meta,
 		Port:     6081,
+		ErrCh:    make(chan error, 1024),
 		RecvCh:   ch,
 		mu:       &sync.Mutex{},
 		wg:       &sync.WaitGroup{},
@@ -54,15 +71,27 @@ func NewTorrentSessionManager(filepath string, r *messaging.Router) (*SessionMan
 
 }
 
-func (mngr *SessionManager) Run() {
+func (mngr *SessionManager) Run(filepath string) {
 
-	TrackerManager := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
-	PeerOrchestrator := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, mngr.ClientId)
-	PieceManager := piece.NewPieceManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
-	IOManager := io.NewIOManager(mngr.Metainfo, mngr.Router)
+	TrackerManager, err := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	if err != nil {
+		mngr.Logger.Fatalf("failed to create tracker manager: %v", err)
+	}
 
-	mngr.coreComponentIds = make([]string, 5)
-	mngr.coreComponentIds = append(mngr.coreComponentIds, TrackerManager)
+	PeerOrchestrator, err := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	if err != nil {
+		mngr.Logger.Fatalf("failed to create peer orchestrator: %v", err)
+	}
+
+	PieceManager, err := piece.NewPieceManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	if err != nil {
+		mngr.Logger.Fatalf("failed to create piece manager: %v", err)
+	}
+
+	IOManager, err := io.NewIOManager(mngr.Metainfo, mngr.Router)
+	if err != nil {
+		mngr.Logger.Fatalf("failed to create io manager: %v", err)
+	}
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 
@@ -75,6 +104,9 @@ func (mngr *SessionManager) Run() {
 	mngr.wg.Add(1)
 	go PieceManager.Run(ctx, mngr.wg)
 
+	mngr.wg.Add(1)
+	go IOManager.Run(ctx, mngr.wg)
+
 	defer mngr.wg.Wait()
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(mngr.Port)))
@@ -83,39 +115,26 @@ func (mngr *SessionManager) Run() {
 	}
 	defer listener.Close()
 
-	mngr.wg.Add(1)
-	go func() {
-		defer mngr.wg.Done()
-		var conn net.Conn
+	for {
+		select {
+		case <-ctx.Done():
+			mngr.Logger.Fatalf("context sent: %v", ctx.Err())
+			ctxCancel()
 
-		for {
-			select {
-			case <-ctx.Done():
-
-				log.Default().Printf("context sent: %v", ctx.Err())
-				return
-
-			default:
-
-				conn, err = listener.Accept()
-				if err != nil {
-					log.Default().Printf("connection from %v rejected: %v", conn.RemoteAddr(), err)
-					conn.Close()
-					continue
-				}
-
-				peerMngr := peer.NewPeerManager(mngr.Router, conn)
-
-				mngr.Router.Publish(messaging.DirectedMessage{
-					ReplyTo:       mngr.id,
-					DestinationID: mngr.id,
-					PayloadType:   messaging.PeerConnected,
-					Payload:       peerMngr,
-					CreatedAt:     time.Now(),
-				})
-
+		default:
+			conn, err := listener.Accept()
+			if err != nil {
+				mngr.Logger.Printf("connection from %v failed: %v", conn.RemoteAddr(), err)
+				conn.Close()
+				continue
 			}
+
+			mngr.Router.Send("peer_orchestrator", messaging.Message{
+				SourceId:    mngr.id,
+				PayloadType: messaging.PeerConnected,
+				Payload:     messaging.PeerConnectedPayload{Conn: conn},
+				CreatedAt:   time.Now(),
+			})
 		}
-	}()
-	ctxCancel()
+	}
 }

@@ -3,7 +3,7 @@ package piece
 import (
 	"context"
 	"crypto/sha1"
-	"errors"
+	"fmt"
 	"math"
 	"math/bits"
 	"math/rand"
@@ -18,12 +18,13 @@ const BLOCK_SIZE = 16384                   // 16KB
 const BLOCK_BITFIELD_SIZE = BLOCK_SIZE / 8 // 2048
 
 type PieceManager struct {
-	id       string
-	ClientId [20]byte
-	Metainfo *metainfo.TorrentMetainfoInfoDict
-	Bitfield bitfield.BitfieldMask
-	RecvCh   <-chan messaging.DirectedMessage
-	Mutex    *sync.Mutex
+	id                      string
+	ClientId                [20]byte
+	PieceToBlockBitfieldMap map[uint32]bitfield.BitfieldMask
+	Metainfo                *metainfo.TorrentMetainfoInfoDict
+	Bitfield                bitfield.BitfieldMask
+	RecvCh                  <-chan messaging.Message
+	mu                      *sync.Mutex
 }
 
 type BlockStatus uint8
@@ -46,9 +47,13 @@ type Piece struct {
 	Blocks        []Block
 }
 
-func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) *PieceManager {
+func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*PieceManager, error) {
 
-	id, ch := r.NewComponent()
+	id, ch := "piece_manager", make(chan messaging.Message, 1024)
+	err := r.RegisterComponent(id, ch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register component with id %w: %v", id, err)
+	}
 
 	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
 
@@ -58,7 +63,7 @@ func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, clientI
 		Metainfo: meta.InfoDict,
 		Bitfield: make(bitfield.BitfieldMask, bitfieldSize),
 		RecvCh:   ch,
-	}
+	}, nil
 }
 
 func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
@@ -68,12 +73,13 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
-			switch msg.MessageType {
+			switch msg.PayloadType {
+
 			case messaging.BlockRequest:
 
-				payload, ok := msg.Data.(messaging.BlockRequestData)
+				payload, ok := msg.Payload.(messaging.BlockRequestPayload)
 				if !ok {
-					mngr.ErrCh <- errors.New("incorrect payload type")
+					// LOG/RETURN/WHATEVER
 					return
 				}
 
@@ -81,18 +87,21 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 			case messaging.BlockSend:
 
-				payload, ok := msg.Data.(messaging.BlockSendData)
+				payload, ok := msg.Payload.(messaging.BlockSendPayload)
 				if !ok {
-					mngr.ErrCh <- errors.New("incorrect payload type")
+					// mngr.ErrCh <- errors.New("incorrect payload type")
+					// log, whatever
 					return
 				}
 
 				go mngr.setBlock(payload)
+			default:
+				// LOG, WHATEVER
 			}
 		case <-ctx.Done():
 			continue
 		default:
-
+			// LOG, WHATEVER
 		}
 	}
 }
@@ -102,8 +111,8 @@ func (mngr *PieceManager) pickNextPiece() {
 }
 
 func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
-	mngr.Mutex.Lock()
-	defer mngr.Mutex.Unlock()
+	mngr.mu.Lock()
+	defer mngr.mu.Unlock()
 
 	var blockIndex int
 	var bitIndex int
@@ -128,8 +137,8 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 
 func (mngr *PieceManager) getBlock(data messaging.BlockRequestData) {
 
-	mngr.Mutex.Lock()
-	defer mngr.Mutex.Unlock()
+	mngr.mu.Lock()
+	defer mngr.mu.Unlock()
 
 	pieceIndex := data.Index
 	blockOffset := data.Offset
@@ -163,8 +172,8 @@ func (mngr *PieceManager) getBlock(data messaging.BlockRequestData) {
 
 func (mngr *PieceManager) setBlock(data messaging.BlockSendData) {
 
-	mngr.Mutex.Lock()
-	defer mngr.Mutex.Unlock()
+	mngr.mu.Lock()
+	defer mngr.mu.Unlock()
 
 	pieceIndex := data.Index
 	blockOffset := data.Offset
@@ -198,8 +207,8 @@ func (mngr *PieceManager) setBlock(data messaging.BlockSendData) {
 
 func (mngr *PieceManager) validatePiece(pieceData []byte, pieceIndex uint32) bool {
 
-	mngr.Mutex.Lock()
-	defer mngr.Mutex.Unlock()
+	mngr.mu.Lock()
+	defer mngr.mu.Unlock()
 
 	metainfoHash := [20]byte(mngr.Metainfo.Pieces[20*pieceIndex : 20*pieceIndex+20])
 	recvHash := sha1.Sum(pieceData)

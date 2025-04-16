@@ -73,34 +73,47 @@ type Tracker struct {
 type TrackerManager struct {
 	id                       string
 	Tracker                  *Tracker
+	Router                   *messaging.Router
 	ClientId                 [20]byte
-	Metainfo                 metainfo.TorrentMetainfo
-	RecvCh                   <-chan messaging.DirectedMessage
+	Metainfo                 *metainfo.TorrentMetainfo
+	RecvCh                   <-chan messaging.Message
 	IsWaitingForAnnounceData bool
-	WaitGroup                *sync.WaitGroup
-	Mu                       *sync.Mutex
+	wg                       *sync.WaitGroup
+	mu                       *sync.Mutex
 }
 
-func NewTrackerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) *TrackerManager {
+func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*TrackerManager, error) {
 
-	id, ch := r.NewComponent()
+	id, ch := "tracker_manager", make(chan messaging.Message, 1024)
+	err := r.RegisterComponent(id, ch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register component with id %w: %v", id, err)
+	}
 
 	return &TrackerManager{
-		id:        id,
-		Tracker:   nil,
-		Metainfo:  meta,
-		ClientId:  clientId,
-		RecvCh:    ch,
-		WaitGroup: &sync.WaitGroup{},
-		Mu:        &sync.Mutex{},
-	}
+		id:       id,
+		Tracker:  nil,
+		Router:   r,
+		Metainfo: meta,
+		ClientId: clientId,
+		RecvCh:   ch,
+		wg:       &sync.WaitGroup{},
+		mu:       &sync.Mutex{},
+	}, nil
 }
 
 func (mngr *TrackerManager) setupTracker() {
 
 	port, err := strconv.Atoi(mngr.Tracker.url.Port())
 	if err != nil {
-		mngr.ErrCh <- errors.New("failed to parse tracker port, aborting")
+		mngr.Router.Send("logger", messaging.Message{
+			SourceId:    mngr.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Msg: "failed to parse tracker port",
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
@@ -115,22 +128,31 @@ func (mngr *TrackerManager) setupTracker() {
 	}
 
 	trackerResponseCh := make(chan AnnounceResponse)
-	if len(mngr.Metainfo.AnnounceList) == 0 {
+	if mngr.Metainfo.AnnounceList == nil {
 
 		trackerUrl, err := url.Parse(mngr.Metainfo.Announce)
+
 		if err != nil {
-			mngr.ErrCh <- errors.New("failed to parse announce URL")
+			mngr.Router.Send("logger", messaging.Message{
+				SourceId:    mngr.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Msg: "failed to parse announce url",
+				},
+				CreatedAt: time.Now(),
+			})
+			return
 		}
 
 		tracker := NewTracker(*trackerUrl)
 
-		mngr.WaitGroup.Add(1)
-		go tracker.Announce(&mngr.WaitGroup, context.Background(), req, trackerResponseCh, mngr.ErrCh)
+		mngr.wg.Add(1)
+		go tracker.Announce(mngr.wg, context.Background(), req, trackerResponseCh)
 
 		timer := time.NewTimer(15 * time.Second)
 		select {
 		case trackerResponse := <-trackerResponseCh:
-			mngr.WaitGroup.Wait()
+			mngr.wg.Wait()
 			close(trackerResponseCh)
 			mngr.Tracker = trackerResponse.tracker
 			mngr.Tracker.interval = trackerResponse.interval
@@ -144,7 +166,14 @@ func (mngr *TrackerManager) setupTracker() {
 			break
 
 		case <-timer.C:
-			mngr.ErrCh <- errors.New("tracker response timed out")
+			mngr.Router.Send("logger", messaging.Message{
+				SourceId:    mngr.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Msg: "announcer response timed out",
+				},
+				CreatedAt: time.Now(),
+			})
 			timer.Stop()
 			return
 		}
@@ -159,14 +188,14 @@ func (mngr *TrackerManager) setupTracker() {
 				}
 
 				tracker := NewTracker(*trackerUrl)
-				mngr.WaitGroup.Add(1)
-				go tracker.Announce(&mngr.WaitGroup, context.Background(), req, trackerResponseCh, mngr.ErrCh)
+				mngr.wg.Add(1)
+				go tracker.Announce(mngr.wg, context.Background(), req, trackerResponseCh, mngr.ErrCh)
 			}
 
 			timer := time.NewTimer(15 * time.Second)
 			select {
 			case trackerResponse := <-trackerResponseCh:
-				mngr.WaitGroup.Wait()
+				mngr.wg.Wait()
 				timer.Stop()
 				close(trackerResponseCh)
 
@@ -234,7 +263,7 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					left:       payload.Left,
 					event:      payload.Event,
 				}
-				go mngr.Tracker.Announce(&mngr.WaitGroup, ctx, req, mngr.AnnounceResponseCh, mngr.ErrCh)
+				go mngr.Tracker.Announce(&mngr.wg, ctx, req, mngr.AnnounceResponseCh, mngr.ErrCh)
 			}
 
 		case msg := <-mngr.AnnounceResponseCh:

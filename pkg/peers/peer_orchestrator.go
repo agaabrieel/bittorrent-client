@@ -3,6 +3,7 @@ package peer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
@@ -13,20 +14,25 @@ import (
 
 type PeerOrchestrator struct {
 	id             string
+	Router         *messaging.Router
 	clientId       [20]byte
 	clientInfohash [20]byte
 	AskedBlocks    []piece.Block
 	Bitfield       bitfield.BitfieldMask
 	Mutex          *sync.RWMutex
 	Waitgroup      *sync.WaitGroup
-	SendCh         chan<- messaging.DirectedMessage
-	RecvCh         <-chan messaging.DirectedMessage
+	SendCh         chan<- messaging.Message
+	RecvCh         <-chan messaging.Message
 	ErrorCh        chan<- error
 }
 
-func NewPeerOrchestrator(meta metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) *PeerOrchestrator {
+func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*PeerOrchestrator, error) {
 
-	id, ch := r.NewComponent()
+	id, ch := "peer_orchestrator", make(chan messaging.Message, 1024)
+	err := r.RegisterComponent(id, ch)
+	if err != nil {
+		return nil, fmt.Errorf("failed to register component with id %w: %v", id, err)
+	}
 
 	return &PeerOrchestrator{
 		id:             id,
@@ -36,7 +42,7 @@ func NewPeerOrchestrator(meta metainfo.TorrentMetainfo, r *messaging.Router, cli
 		RecvCh:         ch,
 		Mutex:          &sync.RWMutex{},
 		Waitgroup:      &sync.WaitGroup{},
-	}
+	}, nil
 }
 
 func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
@@ -47,10 +53,10 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
-			switch msg.MessageType {
-			case messaging.NewPeerFromTracker, messaging.NewPeerConnection:
+			switch msg.PayloadType {
+			case messaging.PeerDiscovered:
 
-				peerMngr, ok := msg.Data.(PeerManager)
+				payload, ok := msg.Payload.(messaging.PeerDiscoveredPayload)
 				if !ok {
 					mngr.ErrorCh <- errors.New("payload has incorrect type")
 					continue
@@ -58,21 +64,24 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 				wg.Add(1)
 				go func() {
-
 					defer wg.Done()
-
-					if msg.MessageType == messaging.NewPeerFromTracker {
-						peerMngr.WaitGroup.Add(1)
-						go peerMngr.startPeerHandshake(childCtx, mngr.ErrorCh, mngr.clientInfohash, mngr.clientId)
-					} else {
-						peerMngr.WaitGroup.Add(1)
-						go peerMngr.replyToPeerHandshake(childCtx, mngr.ErrorCh, mngr.clientInfohash, mngr.clientId)
-					}
+					peerMngr := NewPeerManager(mngr.Router, nil, payload.Addr)
+					go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
 				}()
 
-			case messaging.FileFinished:
-				ctxCancel()
-				return
+			case messaging.PeerConnected:
+				payload, ok := msg.Payload.(messaging.PeerConnectedPayload)
+				if !ok {
+					mngr.ErrorCh <- errors.New("payload has incorrect type")
+					continue
+				}
+
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr())
+					go peerMngr.replyToPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
+				}()
 			}
 
 		case <-ctx.Done():

@@ -1,6 +1,9 @@
 package messaging
 
-import "time"
+import (
+	"net"
+	"time"
+)
 
 type MessageType uint8
 
@@ -11,8 +14,8 @@ const (
 	PieceSend
 	PeerDiscovered
 	PeerConnected
-	PieceValidated
-	PieceInvalidated
+	PieceValidation
+	Error
 )
 
 type Message struct {
@@ -40,15 +43,15 @@ type BlockSendPayload struct {
 	Data   []byte
 }
 
+type PieceRequestPayload struct {
+	Index uint32
+	Size  uint32
+}
+
 type PieceSendPayload struct {
 	Index uint32
 	Size  uint32
 	Data  []byte
-}
-
-type PieceRequestPayload struct {
-	Index uint32
-	Size  uint32
 }
 
 type AnnounceDataRequestPayload struct {
@@ -59,4 +62,21 @@ type AnnounceDataSendPayload struct {
 	Downloaded uint64
 	Left       uint64
 	Event      string
+}
+
+type PeerDiscoveredPayload struct {
+	Addr net.Addr
+}
+
+type PeerConnectedPayload struct {
+	Conn net.Conn
+}
+
+type PieceValidationPayload struct {
+	Index     uint32
+	Validated bool
+}
+
+type ErrorPayload struct {
+	Msg string
 }
