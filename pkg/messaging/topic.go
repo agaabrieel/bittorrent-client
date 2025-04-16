@@ -39,7 +39,7 @@ const (
 )
 
 func newTopic(source Actor, obj Object, action Action, destination Actor) string {
-	return fmt.Sprintf("%s.%s.%s.%s", source, obj, action, destination)
+	return fmt.Sprintf("%s.%s.%s.%s", string(source), string(obj), string(action), string(destination))
 }
 
 func matchTopic(pattern, topic string) bool {
