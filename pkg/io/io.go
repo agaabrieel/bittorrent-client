@@ -13,22 +13,18 @@ import (
 )
 
 type IOManager struct {
+	id        string
 	FD        *os.File
 	FileSize  int64
 	PieceSize int64
-	SendCh    chan<- messaging.Message
-	RecvCh    <-chan messaging.Message
-	ErrCh     chan<- error
-	Mutex     *sync.RWMutex
+	RecvCh    <-chan messaging.DirectedMessage
+	mu        *sync.RWMutex
+	wg        *sync.WaitGroup
 }
 
-func NewIOManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan<- messaging.Message, errCh chan<- error) *IOManager {
+func NewIOManager(meta metainfo.TorrentMetainfo, r *messaging.Router) *IOManager {
 
-	recvCh := make(chan messaging.Message, 256)
-
-	r.Subscribe(messaging.BlockSend, recvCh)
-	r.Subscribe(messaging.PieceSend, recvCh)
-	r.Subscribe(messaging.FileFinished, recvCh)
+	id, ch := r.NewComponent()
 
 	fd, err := os.Create(meta.InfoDict.Name)
 	if err != nil {
@@ -43,13 +39,13 @@ func NewIOManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh c
 	}
 
 	return &IOManager{
+		id:        id,
 		FD:        fd,
 		PieceSize: int64(meta.InfoDict.PieceLength),
 		FileSize:  int64(meta.InfoDict.Length),
-		RecvCh:    recvCh,
-		SendCh:    globalCh,
-		ErrCh:     errCh,
-		Mutex:     &sync.RWMutex{},
+		RecvCh:    ch,
+		mu:        &sync.RWMutex{},
+		wg:        &sync.WaitGroup{},
 	}
 }
 
@@ -131,7 +127,7 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 						writtenBytes += int64(n)
 					}
 
-					mngr.SendCh <- messaging.Message{
+					mngr.SendCh <- messaging.DirectedMessage{
 						MessageType: messaging.BlockSend,
 						Data: messaging.BlockSendData{
 							Index:  payload.Index,

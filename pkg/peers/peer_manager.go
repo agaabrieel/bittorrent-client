@@ -16,10 +16,7 @@ import (
 
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
-	piece "github.com/agaabrieel/bittorrent-client/pkg/piece"
 )
-
-const PEER_WORKERS = 10
 
 type PeerMessageType uint8
 
@@ -44,6 +41,8 @@ type PeerMessage struct {
 }
 
 type PeerManager struct {
+	id              string
+	Router          *messaging.Router
 	PeerId          [20]byte
 	PeerIp          net.IP
 	PeerPort        uint16
@@ -58,28 +57,20 @@ type PeerManager struct {
 	LastMessage     PeerMessage
 	WaitGroup       *sync.WaitGroup
 	Mutex           *sync.RWMutex
-	SendCh          chan<- messaging.Message
-	RecvCh          <-chan messaging.Message
+	RecvCh          <-chan messaging.DirectedMessage
 	ErrCh           chan<- error
 }
 
-func NewPeerManager(r *messaging.Router, globalCh chan<- messaging.Message, conn net.Conn) *PeerManager {
+func NewPeerManager(r *messaging.Router, conn net.Conn) *PeerManager {
 
-	r.Mutex.Lock()
-	defer r.Mutex.Unlock()
-
-	recvCh := make(chan messaging.Message, 256)
-
-	r.Subscribe(messaging.BlockSend, recvCh)
-	r.Subscribe(messaging.PieceValidated, recvCh)
-	r.Subscribe(messaging.PieceInvalidated, recvCh)
+	id, ch := r.NewComponent()
 
 	return &PeerManager{
+		id:        id,
 		PeerConn:  conn,
 		Mutex:     &sync.RWMutex{},
 		WaitGroup: &sync.WaitGroup{},
-		RecvCh:    recvCh,
-		SendCh:    globalCh,
+		RecvCh:    ch,
 	}
 }
 
@@ -340,43 +331,8 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 					case Request:
 
-						if p.IsChoked {
-							p.SendCh <- messaging.Message{
-								MessageType: messaging.Error,
-								Data:        errors.New("peer sent request while being choked"),
-							}
-							return
-						}
-
-						if binary.BigEndian.Uint32(msg.data[13:17]) > piece.BLOCK_SIZE {
-							p.SendCh <- messaging.Message{
-								MessageType: messaging.Error,
-								Data:        fmt.Errorf("peer request has size %d, expected 16 Kb or smaller", binary.BigEndian.Uint32(msg.data[13:17])),
-							}
-							return
-						}
-
-						msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1)
-						copy(msgData[:], msg.data[5:])
-
-						p.SendCh <- messaging.Message{
-							MessageType: messaging.BlockRequest,
-							Data: messaging.BlockRequestData{
-								Index:  binary.BigEndian.Uint32(msg.data[0:4]),
-								Offset: binary.BigEndian.Uint32(msg.data[4:8]),
-								Size:   binary.BigEndian.Uint32(msg.data[8:12]),
-							},
-						}
-
 					case Piece:
 
-						msgData := make([]byte, binary.BigEndian.Uint32(msg.data[0:4])-1) // -1 to account for message ID
-						copy(msgData[:], msg.data[5:])
-
-						p.SendCh <- messaging.Message{
-							MessageType: messaging.BlockSend,
-							Data:        msgData,
-						}
 					}
 				}()
 			}
@@ -398,7 +354,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 						data, ok := msg.Data.(messaging.BlockSendData)
 						if !ok {
-							p.SendCh <- messaging.Message{
+							p.SendCh <- messaging.DirectedMessage{
 								MessageType: messaging.Error,
 								Data:        errors.New("invalid payload type"),
 							}

@@ -71,45 +71,28 @@ type Tracker struct {
 }
 
 type TrackerManager struct {
+	id                       string
 	Tracker                  *Tracker
 	ClientId                 [20]byte
 	Metainfo                 metainfo.TorrentMetainfo
-	SendCh                   chan<- messaging.Message
-	RecvCh                   <-chan messaging.Message
-	AnnounceResponseCh       chan AnnounceResponse
-	ErrCh                    chan<- error
+	RecvCh                   <-chan messaging.DirectedMessage
 	IsWaitingForAnnounceData bool
-	WaitGroup                sync.WaitGroup
-	Mu                       sync.Mutex
-	SubcribedMessageTypes    []messaging.MessageType
+	WaitGroup                *sync.WaitGroup
+	Mu                       *sync.Mutex
 }
 
-func NewTrackerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, ourId [20]byte) *TrackerManager {
+func NewTrackerManager(meta metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) *TrackerManager {
 
-	r.Mutex.Lock()
-	defer r.Mutex.Unlock()
-
-	recvCh := make(chan messaging.Message, 256)
-
-	r.Subscribe(messaging.AnnounceDataResponse, recvCh)
-	r.Subscribe(messaging.PieceInvalidated, recvCh)
-	r.Subscribe(messaging.PieceValidated, recvCh)
-	r.Subscribe(messaging.FileFinished, recvCh)
+	id, ch := r.NewComponent()
 
 	return &TrackerManager{
-		Tracker:            nil,
-		Metainfo:           meta,
-		ClientId:           ourId,
-		SendCh:             globalCh,
-		RecvCh:             recvCh,
-		AnnounceResponseCh: make(chan AnnounceResponse),
-		WaitGroup:          sync.WaitGroup{},
-		Mu:                 sync.Mutex{},
-		ErrCh:              make(chan error),
-		SubcribedMessageTypes: []messaging.MessageType{
-			messaging.AnnounceDataResponse,
-			messaging.FileFinished,
-		},
+		id:        id,
+		Tracker:   nil,
+		Metainfo:  meta,
+		ClientId:  clientId,
+		RecvCh:    ch,
+		WaitGroup: &sync.WaitGroup{},
+		Mu:        &sync.Mutex{},
 	}
 }
 
@@ -208,7 +191,7 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 	mngr.setupTracker()
 	for _, peer := range mngr.Tracker.peers {
-		mngr.SendCh <- messaging.Message{
+		mngr.SendCh <- messaging.DirectedMessage{
 			MessageType: messaging.NewPeerFromTracker,
 			Data:        peer,
 		}
@@ -261,7 +244,7 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 			for _, peer := range msg.peers {
 				if !mngr.Tracker.peerMap[peer.PeerId] {
-					mngr.SendCh <- messaging.Message{
+					mngr.SendCh <- messaging.DirectedMessage{
 						MessageType: messaging.NewPeerFromTracker,
 						Data:        peer,
 					}
@@ -272,7 +255,7 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 		case <-timer.C:
 			if !mngr.IsWaitingForAnnounceData {
-				mngr.SendCh <- messaging.Message{
+				mngr.SendCh <- messaging.DirectedMessage{
 					MessageType: messaging.AnnounceDataRequest,
 					Data:        nil,
 				}

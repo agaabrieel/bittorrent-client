@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha1"
 	"errors"
-	"fmt"
 	"math"
 	"math/bits"
 	"math/rand"
@@ -19,11 +18,11 @@ const BLOCK_SIZE = 16384                   // 16KB
 const BLOCK_BITFIELD_SIZE = BLOCK_SIZE / 8 // 2048
 
 type PieceManager struct {
+	id       string
+	ClientId [20]byte
 	Metainfo *metainfo.TorrentMetainfoInfoDict
 	Bitfield bitfield.BitfieldMask
-	SendCh   chan<- messaging.Message
-	RecvCh   <-chan messaging.Message
-	ErrCh    chan<- error
+	RecvCh   <-chan messaging.DirectedMessage
 	Mutex    *sync.Mutex
 }
 
@@ -47,22 +46,18 @@ type Piece struct {
 	Blocks        []Block
 }
 
-func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message) *PieceManager {
+func NewPieceManager(meta metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) *PieceManager {
 
-	recvCh := make(chan messaging.Message, 256)
-
-	r.Subscribe(fmt.Sprintf("tracker_manager.peer.discovered.peer_manager_%s"), recvCh)
-	r.Subscribe("", recvCh)
-	r.Subscribe("", recvCh)
+	id, ch := r.NewComponent()
 
 	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
 
 	return &PieceManager{
+		id:       id,
+		ClientId: clientId,
 		Metainfo: meta.InfoDict,
 		Bitfield: make(bitfield.BitfieldMask, bitfieldSize),
-		SendCh:   globalCh,
-		RecvCh:   recvCh,
-		ErrCh:    make(chan error),
+		RecvCh:   ch,
 	}
 }
 
@@ -123,7 +118,7 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 
 		bitIndex = bits.Len(uint(bitfieldByte)) - 1
 		// start: pieceLen * pieceIndex, offset: blockSize * (blockIndex + bitIndex)
-		mngr.SendCh <- messaging.Message{
+		mngr.SendCh <- messaging.DirectedMessage{
 			MessageType: messaging.BlockSend,
 			Data:        []byte{byte(mngr.Metainfo.PieceLength), byte(BLOCK_SIZE * (blockIndex + bitIndex))},
 		}
@@ -145,7 +140,7 @@ func (mngr *PieceManager) getBlock(data messaging.BlockRequestData) {
 
 	copy(blockData[0:], mngr.Pieces[pieceIndex].Blocks[blockIndex].Data[0:blockSize])
 
-	mngr.SendCh <- messaging.Message{
+	mngr.SendCh <- messaging.DirectedMessage{
 		MessageType: messaging.BlockSend,
 		Data: messaging.BlockSendData{
 			Index:  pieceIndex,
@@ -194,7 +189,7 @@ func (mngr *PieceManager) setBlock(data messaging.BlockSendData) {
 	var responseBuffer []byte
 	var responseType messaging.MessageType
 
-	mngr.SendCh <- messaging.Message{
+	mngr.SendCh <- messaging.DirectedMessage{
 		MessageType: responseType,
 		Data:        responseBuffer,
 	}

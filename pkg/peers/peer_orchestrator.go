@@ -12,39 +12,28 @@ import (
 )
 
 type PeerOrchestrator struct {
+	id             string
 	clientId       [20]byte
 	clientInfohash [20]byte
 	AskedBlocks    []piece.Block
 	Bitfield       bitfield.BitfieldMask
 	Mutex          *sync.RWMutex
 	Waitgroup      *sync.WaitGroup
-	SendCh         chan<- messaging.Message
-	RecvCh         <-chan messaging.Message
+	SendCh         chan<- messaging.DirectedMessage
+	RecvCh         <-chan messaging.DirectedMessage
 	ErrorCh        chan<- error
 }
 
-func NewPeerOrchestrator(meta metainfo.TorrentMetainfo, r *messaging.Router, globalCh chan messaging.Message, id [20]byte) *PeerOrchestrator {
+func NewPeerOrchestrator(meta metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) *PeerOrchestrator {
 
-	r.Mutex.Lock()
-	defer r.Mutex.Unlock()
-
-	recvCh := make(chan messaging.Message, 256)
-
-	r.Subscribe(messaging.NewPeerFromTracker, recvCh)
-	r.Subscribe(messaging.NewPeerConnection, recvCh)
-	r.Subscribe(messaging.PeerUpdate, recvCh)
-	r.Subscribe(messaging.BlockSend, recvCh)
-	r.Subscribe(messaging.PieceInvalidated, recvCh)
-	r.Subscribe(messaging.PieceValidated, recvCh)
-	r.Subscribe(messaging.FileFinished, recvCh)
+	id, ch := r.NewComponent()
 
 	return &PeerOrchestrator{
-		clientId:       id,
+		id:             id,
+		clientId:       clientId,
 		clientInfohash: meta.Infohash,
 		Bitfield:       bitfield.NewBitfield(uint32(float64((meta.InfoDict.Length / meta.InfoDict.PieceLength) / 8))),
-		ErrorCh:        make(chan error, 256),
-		RecvCh:         recvCh,
-		SendCh:         globalCh,
+		RecvCh:         ch,
 		Mutex:          &sync.RWMutex{},
 		Waitgroup:      &sync.WaitGroup{},
 	}
