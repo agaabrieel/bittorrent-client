@@ -7,7 +7,6 @@ import (
 	"math"
 	"math/bits"
 	"math/rand"
-	"os"
 	"sync"
 
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
@@ -21,7 +20,8 @@ const BLOCK_BITFIELD_SIZE = BLOCK_SIZE / 8 // 2048
 type PieceManager struct {
 	id                  string
 	ClientId            [20]byte
-	PieceFileMap        map[uint32]*os.File
+	FileCache           *FileCache
+	PieceFileMap        map[uint32]string
 	PieceBlocksBitfield map[uint32][]bitfield.BitfieldMask
 	Metainfo            *metainfo.TorrentMetainfoInfoDict
 	Bitfield            bitfield.BitfieldMask
@@ -58,13 +58,14 @@ func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, client
 	}
 
 	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
-	pieceFileMap := make(map[uint32]*os.File, int(math.Ceil(float64(meta.InfoDict.Length)/float64(meta.InfoDict.PieceLength))))
+	pieceFileMap := make(map[uint32]string, int(math.Ceil(float64(meta.InfoDict.Length)/float64(meta.InfoDict.PieceLength))))
 	pieceBlocksBitfieldMap := make(map[uint32][]bitfield.BitfieldMask, int(meta.InfoDict.Length))
 
 	return &PieceManager{
 		id:                  id,
 		ClientId:            clientId,
 		PieceFileMap:        pieceFileMap,
+		FileCache:           NewFileCache(MAX_OPEN_FILES),
 		PieceBlocksBitfield: pieceBlocksBitfieldMap,
 		Metainfo:            meta.InfoDict,
 		Bitfield:            make(bitfield.BitfieldMask, bitfieldSize),
@@ -191,15 +192,11 @@ func (mngr *PieceManager) setBlock(msg messaging.Message) {
 	blockIdx := data.Index
 	blockData := data.Data
 
-	if mngr.PieceFileMap[blockIdx] == nil {
-		var err error
-		mngr.PieceFileMap[blockIdx], err = os.CreateTemp("", fmt.Sprintf("piece-%d-*", blockIdx))
-		if err != nil {
-			// log something
-			return
-		}
+	f, err := mngr.FileCache.GetFile(blockIdx)
+	if err != nil {
+		// log shit
+		return
 	}
-	f := mngr.PieceFileMap[blockIdx]
 
 	if mngr.PieceBlocksBitfield[blockIdx] == nil {
 		mngr.PieceBlocksBitfield[blockIdx] = make([]bitfield.BitfieldMask, (mngr.Metainfo.PieceLength/BLOCK_BITFIELD_SIZE)/8)
@@ -208,10 +205,8 @@ func (mngr *PieceManager) setBlock(msg messaging.Message) {
 
 	bf[blockIdx/8].SetPiece(uint32(blockIdx % 8))
 
-	_, err := f.WriteAt(blockData, int64(blockIdx)*int64(mngr.Metainfo.PieceLength)+int64(blockOffset))
-	if err != nil {
-		// do stuff
-	}
+	f.WriteAt(blockData, int64(blockIdx)*int64(mngr.Metainfo.PieceLength)+int64(blockOffset))
+
 }
 
 func (mngr *PieceManager) validatePiece(pieceData []byte, pieceIndex uint32) bool {
