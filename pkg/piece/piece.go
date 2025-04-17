@@ -7,6 +7,7 @@ import (
 	"math"
 	"math/bits"
 	"math/rand"
+	"os"
 	"sync"
 
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
@@ -18,13 +19,14 @@ const BLOCK_SIZE = 16384                   // 16KB
 const BLOCK_BITFIELD_SIZE = BLOCK_SIZE / 8 // 2048
 
 type PieceManager struct {
-	id                      string
-	ClientId                [20]byte
-	PieceToBlockBitfieldMap map[uint32]bitfield.BitfieldMask
-	Metainfo                *metainfo.TorrentMetainfoInfoDict
-	Bitfield                bitfield.BitfieldMask
-	RecvCh                  <-chan messaging.Message
-	mu                      *sync.Mutex
+	id                  string
+	ClientId            [20]byte
+	PieceFileMap        map[uint32]*os.File
+	PieceBlocksBitfield map[uint32][]bitfield.BitfieldMask
+	Metainfo            *metainfo.TorrentMetainfoInfoDict
+	Bitfield            bitfield.BitfieldMask
+	RecvCh              <-chan messaging.Message
+	mu                  *sync.RWMutex
 }
 
 type BlockStatus uint8
@@ -56,13 +58,18 @@ func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, client
 	}
 
 	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
+	pieceFileMap := make(map[uint32]*os.File, int(math.Ceil(float64(meta.InfoDict.Length)/float64(meta.InfoDict.PieceLength))))
+	pieceBlocksBitfieldMap := make(map[uint32][]bitfield.BitfieldMask, int(meta.InfoDict.Length))
 
 	return &PieceManager{
-		id:       id,
-		ClientId: clientId,
-		Metainfo: meta.InfoDict,
-		Bitfield: make(bitfield.BitfieldMask, bitfieldSize),
-		RecvCh:   ch,
+		id:                  id,
+		ClientId:            clientId,
+		PieceFileMap:        pieceFileMap,
+		PieceBlocksBitfield: pieceBlocksBitfieldMap,
+		Metainfo:            meta.InfoDict,
+		Bitfield:            make(bitfield.BitfieldMask, bitfieldSize),
+		RecvCh:              ch,
+		mu:                  &sync.RWMutex{},
 	}, nil
 }
 
@@ -77,24 +84,24 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 			case messaging.BlockRequest:
 
-				payload, ok := msg.Payload.(messaging.BlockRequestPayload)
+				_, ok := msg.Payload.(messaging.BlockRequestPayload)
 				if !ok {
 					// LOG/RETURN/WHATEVER
 					return
 				}
 
-				go mngr.getBlock(payload)
+				go mngr.getBlock(msg)
 
 			case messaging.BlockSend:
 
-				payload, ok := msg.Payload.(messaging.BlockSendPayload)
+				_, ok := msg.Payload.(messaging.BlockSendPayload)
 				if !ok {
 					// mngr.ErrCh <- errors.New("incorrect payload type")
 					// log, whatever
 					return
 				}
 
-				go mngr.setBlock(payload)
+				go mngr.setBlock(msg)
 			default:
 				// LOG, WHATEVER
 			}
@@ -135,7 +142,7 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 
 }
 
-func (mngr *PieceManager) getBlock(data messaging.BlockRequestData) {
+func (mngr *PieceManager) getBlock(msg messaging.Message) {
 
 	mngr.mu.Lock()
 	defer mngr.mu.Unlock()
@@ -170,45 +177,47 @@ func (mngr *PieceManager) getBlock(data messaging.BlockRequestData) {
 
 }
 
-func (mngr *PieceManager) setBlock(data messaging.BlockSendData) {
+func (mngr *PieceManager) setBlock(msg messaging.Message) {
 
 	mngr.mu.Lock()
 	defer mngr.mu.Unlock()
 
-	pieceIndex := data.Index
+	data, ok := msg.Payload.(messaging.BlockSendPayload)
+	if !ok {
+		return
+	}
+
 	blockOffset := data.Offset
+	blockIdx := data.Index
 	blockData := data.Data
-	blockIndex := blockOffset / BLOCK_SIZE
 
-	piece := mngr.Pieces[pieceIndex]
-
-	if piece.Blocks == nil {
-		piece.Blocks = make([]Block, mngr.Metainfo.PieceLength/BLOCK_SIZE)
+	if mngr.PieceFileMap[blockIdx] == nil {
+		var err error
+		mngr.PieceFileMap[blockIdx], err = os.CreateTemp("", fmt.Sprintf("piece-%d-*", blockIdx))
+		if err != nil {
+			// log something
+			return
+		}
 	}
+	f := mngr.PieceFileMap[blockIdx]
 
-	if piece.BlockBitfield == nil {
-		piece.BlockBitfield = make(bitfield.BitfieldMask, BLOCK_BITFIELD_SIZE)
+	if mngr.PieceBlocksBitfield[blockIdx] == nil {
+		mngr.PieceBlocksBitfield[blockIdx] = make([]bitfield.BitfieldMask, (mngr.Metainfo.PieceLength/BLOCK_BITFIELD_SIZE)/8)
 	}
+	bf := mngr.PieceBlocksBitfield[blockIdx]
 
-	copy(piece.Blocks[blockIndex].Data[:], blockData[:])
+	bf[blockIdx/8].SetPiece(uint32(blockIdx % 8))
 
-	bitIdx := blockOffset/BLOCK_SIZE + blockOffset%BLOCK_SIZE
-	piece.BlockBitfield.SetPiece(bitIdx)
-
-	var responseBuffer []byte
-	var responseType messaging.MessageType
-
-	mngr.SendCh <- messaging.DirectedMessage{
-		MessageType: responseType,
-		Data:        responseBuffer,
+	_, err := f.WriteAt(blockData, int64(blockIdx)*int64(mngr.Metainfo.PieceLength)+int64(blockOffset))
+	if err != nil {
+		// do stuff
 	}
-
 }
 
 func (mngr *PieceManager) validatePiece(pieceData []byte, pieceIndex uint32) bool {
 
-	mngr.mu.Lock()
-	defer mngr.mu.Unlock()
+	mngr.mu.RLock()
+	defer mngr.mu.RUnlock()
 
 	metainfoHash := [20]byte(mngr.Metainfo.Pieces[20*pieceIndex : 20*pieceIndex+20])
 	recvHash := sha1.Sum(pieceData)
