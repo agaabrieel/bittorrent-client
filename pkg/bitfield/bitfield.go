@@ -46,3 +46,8 @@ func (bf BitfieldMask) GetIntersection(other BitfieldMask) BitfieldMask {
 	}
 	return intersection
 }
+
+// MOCKUP!!!!!!!!!
+func (bf BitfieldMask) IsFull() bool {
+	return false
+}
