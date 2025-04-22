@@ -8,4 +8,4 @@ require github.com/edsrzf/mmap-go v1.2.0
 
 require golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e // indirect
 
-require github.com/shirou/gopsutil/v3/mem v1.0.0
+require github.com/bits-and-blooms/bitset v1.22.0
