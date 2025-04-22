@@ -13,6 +13,7 @@ import (
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
+	bitset "github.com/bits-and-blooms/bitset"
 )
 
 type PieceManager struct {
@@ -36,6 +37,8 @@ func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, client
 
 	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
 	cacheCapacity := PIECE_BUFFER_MAX_SIZE / meta.InfoDict.PieceLength
+
+	bs := bitset.New(uint(bitfieldSize))
 
 	return &PieceManager{
 		id:         id,
