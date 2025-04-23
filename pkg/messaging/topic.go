@@ -10,7 +10,6 @@ import (
 // wildcard * for any individual segment
 
 type Topic string
-
 type Actor string
 type Object string
 type Action string

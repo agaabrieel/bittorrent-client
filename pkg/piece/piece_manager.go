@@ -5,12 +5,9 @@ import (
 	"crypto/sha1"
 	"fmt"
 	"math"
-	"math/bits"
-	"math/rand"
 	"sync"
 	"time"
 
-	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	bitset "github.com/bits-and-blooms/bitset"
@@ -22,7 +19,7 @@ type PieceManager struct {
 	Router     *messaging.Router
 	PieceCache *PieceCache
 	Metainfo   *metainfo.TorrentMetainfoInfoDict
-	Bitfield   bitfield.BitfieldMask
+	Bitfield   *bitset.BitSet
 	RecvCh     <-chan messaging.Message
 	mu         *sync.RWMutex
 }
@@ -32,13 +29,11 @@ func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, client
 	id, ch := "piece_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
 	if err != nil {
-		return nil, fmt.Errorf("failed to register component with id %w: %v", id, err)
+		return nil, fmt.Errorf("failed to register component with id %s: %w", id, err)
 	}
 
 	bitfieldSize := int(math.Ceil((math.Ceil(float64(meta.InfoDict.Length) / float64(meta.InfoDict.PieceLength))) / 8))
 	cacheCapacity := PIECE_BUFFER_MAX_SIZE / meta.InfoDict.PieceLength
-
-	bs := bitset.New(uint(bitfieldSize))
 
 	return &PieceManager{
 		id:         id,
@@ -46,7 +41,7 @@ func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, client
 		Router:     r,
 		PieceCache: NewPieceCache(uint32(cacheCapacity)),
 		Metainfo:   meta.InfoDict,
-		Bitfield:   make(bitfield.BitfieldMask, bitfieldSize),
+		Bitfield:   bitset.New(uint(bitfieldSize)),
 		RecvCh:     ch,
 		mu:         &sync.RWMutex{},
 	}, nil
@@ -94,31 +89,12 @@ func (mngr *PieceManager) pickNextPiece() {
 }
 
 func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
-	mngr.mu.Lock()
-	defer mngr.mu.Unlock()
-
-	var blockIndex int
-	var bitIndex int
-	var bitfieldByte byte
-	for {
-		blockIndex = rand.Intn(BLOCK_BITFIELD_SIZE)
-		bitfieldByte = mngr.Pieces[pieceIndex].BlockBitfield[blockIndex]
-
-		if bitfieldByte == 0 {
-			continue
-		}
-
-		bitIndex = bits.Len(uint(bitfieldByte)) - 1
-		// start: pieceLen * pieceIndex, offset: blockSize * (blockIndex + bitIndex)
-		mngr.SendCh <- messaging.DirectedMessage{
-			MessageType: messaging.BlockSend,
-			Data:        []byte{byte(mngr.Metainfo.PieceLength), byte(BLOCK_SIZE * (blockIndex + bitIndex))},
-		}
-	}
-
 }
 
 func (mngr *PieceManager) processBlockRequest(msg messaging.Message) {
+
+	var blockData []byte
+	var err error
 
 	mngr.mu.Lock()
 	defer mngr.mu.Unlock()
@@ -131,24 +107,38 @@ func (mngr *PieceManager) processBlockRequest(msg messaging.Message) {
 
 	mngr.PieceCache.mu.Lock()
 	defer mngr.PieceCache.mu.Unlock()
-	blockData, err := mngr.PieceCache.GetBlock(data.Index, data.Offset)
+
+	blockData, err = mngr.PieceCache.GetBlock(data.Index, data.Offset, data.Size)
 	if err != nil {
-		// log
-		return
+
+		mngr.Router.Send(msg.ReplyTo, messaging.Message{
+			SourceId:    mngr.id,
+			ReplyTo:     mngr.id,
+			PayloadType: messaging.BlockSend,
+			Payload: messaging.BlockSendPayload{
+				Index:  data.Index,
+				Offset: data.Offset,
+				Size:   uint32(len(blockData)),
+				Data:   blockData,
+			},
+			CreatedAt: time.Now(),
+		})
+
+	} else {
+
+		mngr.Router.Send("io_manager", messaging.Message{
+			SourceId:    mngr.id,
+			ReplyTo:     msg.ReplyTo,
+			PayloadType: messaging.BlockRequest,
+			Payload: messaging.BlockRequestPayload{
+				Index:  data.Index,
+				Offset: data.Offset,
+				Size:   data.Size,
+			},
+			CreatedAt: time.Now(),
+		})
+
 	}
-
-	mngr.Router.Send(msg.SourceId, messaging.Message{
-		SourceId:    mngr.id,
-		PayloadType: messaging.BlockSend,
-		Payload: messaging.BlockSendPayload{
-			Index:  data.Index,
-			Offset: data.Offset,
-			Size:   uint32(len(blockData)),
-			Data:   blockData,
-		},
-		CreatedAt: time.Now(),
-	})
-
 }
 
 func (mngr *PieceManager) processBlockSend(msg messaging.Message) {
@@ -158,21 +148,62 @@ func (mngr *PieceManager) processBlockSend(msg messaging.Message) {
 
 	data, ok := msg.Payload.(messaging.BlockSendPayload)
 	if !ok {
+		// log
 		return
 	}
 
 	mngr.PieceCache.mu.Lock()
 	defer mngr.PieceCache.mu.Unlock()
+
 	mngr.PieceCache.PutBlock(data.Data, data.Index, data.Offset)
+
+	if isComplete, err := mngr.PieceCache.isPieceComplete(data.Index, uint32(mngr.Metainfo.PieceLength)); isComplete && err != nil && mngr.validatePiece(data.Index) {
+
+		piece, err := mngr.PieceCache.GetPiece(data.Index)
+		if err != nil {
+
+		}
+
+		mngr.Bitfield.Set(uint(data.Index))
+
+		mngr.Router.Broadcast(messaging.Message{
+			SourceId:    mngr.id,
+			ReplyTo:     mngr.id,
+			PayloadType: messaging.PieceValidated,
+			Payload: messaging.PieceValidatedPayload{
+				Index: data.Index,
+			},
+			CreatedAt: time.Now(),
+		})
+
+		mngr.Router.Send("io_manager", messaging.Message{
+			SourceId:    mngr.id,
+			ReplyTo:     mngr.id,
+			PayloadType: messaging.PieceSend,
+			Payload: messaging.PieceSendPayload{
+				Index: data.Index,
+				Size:  uint32(len(piece.Blocks)),
+				Data:  piece.Blocks,
+			},
+			CreatedAt: time.Now(),
+		})
+
+	}
 }
 
-func (mngr *PieceManager) validatePiece(pieceData []byte, pieceIndex uint32) bool {
+func (mngr *PieceManager) validatePiece(pieceIndex uint32) bool {
 
 	mngr.mu.RLock()
 	defer mngr.mu.RUnlock()
 
-	metainfoHash := [20]byte(mngr.Metainfo.Pieces[20*pieceIndex : 20*pieceIndex+20])
-	recvHash := sha1.Sum(pieceData)
+	mngr.PieceCache.mu.Lock()
+	defer mngr.PieceCache.mu.Unlock()
 
-	return recvHash == metainfoHash
+	piece, err := mngr.PieceCache.GetPiece(pieceIndex)
+	if err != nil {
+		// log
+		return false
+	}
+
+	return sha1.Sum(piece.Blocks) == [20]byte(mngr.Metainfo.Pieces[20*pieceIndex:20*pieceIndex+20])
 }

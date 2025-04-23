@@ -2,20 +2,17 @@ package messaging
 
 import (
 	"fmt"
-	"log"
 	"sync"
 )
 
 type Router struct {
 	Registry map[string]chan<- Message
-	Logger   *log.Logger
 	mu       *sync.RWMutex
 }
 
-func NewRouter(logger *log.Logger) *Router {
+func NewRouter() *Router {
 	return &Router{
 		Registry: make(map[string]chan<- Message, 1024),
-		Logger:   logger,
 		mu:       &sync.RWMutex{},
 	}
 }
@@ -35,16 +32,33 @@ func (r *Router) Send(destId string, msg Message) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	if msg.PayloadType == Error && destId == "error" {
-		if err, ok := msg.Payload.(ErrorPayload); ok {
-			r.Logger.Print(err.Msg)
-		}
-		return
-	}
+	//if msg.PayloadType == Error && destId == "error" {
+	//	if err, ok := msg.Payload.(ErrorPayload); ok {
+	//		r.Logger.Print(err.Msg)
+	//	}
+	//	return
+	//}
 
 	if ch, ok := r.Registry[destId]; ok {
-		ch <- msg
-		return
+		select {
+		case ch <- msg:
+		default:
+			//log
+		}
+	}
+}
+
+func (r *Router) Broadcast(msg Message) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, ch := range r.Registry {
+		select {
+		case ch <- msg:
+		default:
+			//log
+			continue
+		}
 	}
 }
 

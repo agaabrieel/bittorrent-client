@@ -14,7 +14,7 @@ import (
 
 type IOManager struct {
 	id        string
-	FD        *os.File
+	file      *os.File
 	Router    *messaging.Router
 	FileSize  int64
 	PieceSize int64
@@ -31,19 +31,19 @@ func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router) (*IOManag
 		return nil, fmt.Errorf("failed to register component: %v", err)
 	}
 
-	fd, err := os.Create(meta.InfoDict.Name)
+	f, err := os.Create(meta.InfoDict.Name)
 	if err != nil {
 		return nil, fmt.Errorf("file creation failed: %v", err)
 	}
 
-	err = fd.Truncate(int64(meta.InfoDict.Length))
+	err = f.Truncate(int64(meta.InfoDict.Length))
 	if err != nil {
 		return nil, fmt.Errorf("failed to allocate enough size for the file: %v", err)
 	}
 
 	return &IOManager{
 		id:        id,
-		FD:        fd,
+		file:      f,
 		Router:    r,
 		PieceSize: int64(meta.InfoDict.PieceLength),
 		FileSize:  int64(meta.InfoDict.Length),
@@ -54,7 +54,7 @@ func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router) (*IOManag
 }
 
 func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
-	defer mngr.FD.Close()
+	defer mngr.file.Close()
 	defer wg.Done()
 
 	_, cancel := context.WithCancel(ctx)
@@ -86,7 +86,7 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 						return
 					}
 
-					offset, err := mngr.FD.Seek(int64(payload.Index)*mngr.FileSize, 0)
+					offset, err := mngr.file.Seek(int64(payload.Index)*mngr.FileSize, 0)
 					if err != nil {
 
 						mngr.Router.Send("", messaging.Message{
@@ -104,7 +104,7 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					payloadSize := int64(len(payload.Data))
 					for writtenBytes < payloadSize {
 
-						n, err := mngr.FD.WriteAt(payload.Data[writtenBytes:], offset+int64(writtenBytes))
+						n, err := mngr.file.WriteAt(payload.Data[writtenBytes:], offset+int64(writtenBytes))
 
 						if err != nil && err != io.EOF {
 
@@ -147,7 +147,7 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 					buffer := make([]byte, payload.Size)
 
-					offset, err := mngr.FD.Seek(int64(payload.Index)*mngr.FileSize+int64(payload.Offset), 0)
+					offset, err := mngr.file.Seek(int64(payload.Index)*mngr.FileSize+int64(payload.Offset), 0)
 					if err != nil {
 						mngr.Router.Send("", messaging.Message{
 							SourceId:    mngr.id,
@@ -162,8 +162,9 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 					writtenBytes := int64(0)
 					for writtenBytes < int64(payload.Size) {
-						n, err := mngr.FD.ReadAt(buffer[writtenBytes:], offset+int64(writtenBytes))
+						n, err := mngr.file.ReadAt(buffer[writtenBytes:], offset+int64(writtenBytes))
 						if err != nil && err != io.EOF {
+
 							mngr.Router.Send("", messaging.Message{
 								SourceId:    mngr.id,
 								PayloadType: messaging.Error,
@@ -173,12 +174,14 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 								CreatedAt: time.Now(),
 							})
 							return
+
 						}
 						writtenBytes += int64(n)
 					}
 
-					mngr.Router.Send(msg.SourceId, messaging.Message{
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
 						SourceId:    mngr.id,
+						ReplyTo:     mngr.id,
 						PayloadType: messaging.BlockSend,
 						Payload: messaging.BlockSendPayload{
 							Index:  payload.Index,

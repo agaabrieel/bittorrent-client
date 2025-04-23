@@ -184,12 +184,14 @@ func (mngr *TrackerManager) setupTracker() {
 
 				trackerUrl, err := url.Parse(tracker)
 				if err != nil {
-					mngr.ErrCh <- errors.New("failed to parse announce URL")
+					// log
+					//mngr.ErrCh <- errors.New("failed to parse announce URL")
+					return
 				}
 
 				tracker := NewTracker(*trackerUrl)
 				mngr.wg.Add(1)
-				go tracker.Announce(mngr.wg, context.Background(), req, trackerResponseCh, mngr.ErrCh)
+				go tracker.Announce(mngr.wg, context.Background(), req, trackerResponseCh)
 			}
 
 			timer := time.NewTimer(15 * time.Second)
@@ -324,18 +326,18 @@ func NewTracker(trackerUrl url.URL) Tracker {
 	}
 }
 
-func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req AnnounceRequest, respCh chan<- AnnounceResponse, errCh chan<- error) {
+func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req AnnounceRequest, respCh chan<- AnnounceResponse) {
 
 	defer wg.Done()
 
 	if t.client == nil {
-		errCh <- errors.New("tracker does not implement client")
+		// errCh <- errors.New("tracker does not implement client")
 		return
 	}
 
 	resp, err := t.client.Announce(ctx, t.url, req)
 	if err != nil {
-		errCh <- fmt.Errorf("failed tracker announce: %w", err)
+		// errCh <- fmt.Errorf("failed tracker announce: %w", err)
 	}
 
 	if resp.interval > 0 {

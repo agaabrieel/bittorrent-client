@@ -14,12 +14,13 @@ const (
 	PieceSend
 	PeerDiscovered
 	PeerConnected
-	PieceValidation
+	PieceValidated
 	Error
 )
 
 type Message struct {
 	SourceId    string
+	ReplyTo     string
 	PayloadType MessageType
 	Payload     any
 	CreatedAt   time.Time
@@ -72,9 +73,8 @@ type PeerConnectedPayload struct {
 	Conn net.Conn
 }
 
-type PieceValidationPayload struct {
-	Index     uint32
-	Validated bool
+type PieceValidatedPayload struct {
+	Index uint32
 }
 
 type ErrorPayload struct {

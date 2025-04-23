@@ -4,14 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"log"
 	"net"
-	"os"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/agaabrieel/bittorrent-client/pkg/io"
+	logger "github.com/agaabrieel/bittorrent-client/pkg/logger"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	peer "github.com/agaabrieel/bittorrent-client/pkg/peers"
@@ -21,7 +20,6 @@ import (
 
 type SessionManager struct {
 	id               string
-	Logger           *log.Logger
 	Router           *messaging.Router
 	ClientId         [20]byte
 	Port             int
@@ -45,21 +43,14 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 
 	id, ch := "session_manager", make(chan messaging.Message, 1024)
 
-	logFile, err := os.Create(fmt.Sprintf("%s-%s", id, meta.Infohash))
-	if err != nil {
-		return nil, fmt.Errorf("failed to create log file: %v", err)
-	}
-	logger := log.New(logFile, logFile.Name(), 10111)
-
-	err = r.RegisterComponent(id, ch)
+	err := r.RegisterComponent(id, ch)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register component with id %s: %v", id, err)
 	}
 
 	return &SessionManager{
 		id:       id,
-		Router:   messaging.NewRouter(logger),
-		Logger:   logger,
+		Router:   messaging.NewRouter(),
 		ClientId: clientId,
 		Metainfo: meta,
 		Port:     6081,
@@ -73,24 +64,29 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 
 func (mngr *SessionManager) Run(filepath string) {
 
+	Logger, err := logger.NewLogger(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	if err != nil {
+		panic(err)
+	}
+
 	TrackerManager, err := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
 	if err != nil {
-		mngr.Logger.Fatalf("failed to create tracker manager: %v", err)
+		Logger.Fatalf("failed to create tracker manager: %v", err)
 	}
 
 	PeerOrchestrator, err := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, mngr.ClientId)
 	if err != nil {
-		mngr.Logger.Fatalf("failed to create peer orchestrator: %v", err)
+		Logger.Fatalf("failed to create peer orchestrator: %v", err)
 	}
 
 	PieceManager, err := piece.NewPieceManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
 	if err != nil {
-		mngr.Logger.Fatalf("failed to create piece manager: %v", err)
+		Logger.Fatalf("failed to create piece manager: %v", err)
 	}
 
 	IOManager, err := io.NewIOManager(mngr.Metainfo, mngr.Router)
 	if err != nil {
-		mngr.Logger.Fatalf("failed to create io manager: %v", err)
+		Logger.Fatalf("failed to create io manager: %v", err)
 	}
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
@@ -107,6 +103,9 @@ func (mngr *SessionManager) Run(filepath string) {
 	mngr.wg.Add(1)
 	go IOManager.Run(ctx, mngr.wg)
 
+	mngr.wg.Add(1)
+	go Logger.Run(ctx, mngr.wg)
+
 	defer mngr.wg.Wait()
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(mngr.Port)))
@@ -118,19 +117,20 @@ func (mngr *SessionManager) Run(filepath string) {
 	for {
 		select {
 		case <-ctx.Done():
-			mngr.Logger.Fatalf("context sent: %v", ctx.Err())
+			Logger.Fatalf("context sent: %v", ctx.Err())
 			ctxCancel()
 
 		default:
 			conn, err := listener.Accept()
 			if err != nil {
-				mngr.Logger.Printf("connection from %v failed: %v", conn.RemoteAddr(), err)
+				Logger.Printf("connection from %v failed: %v", conn.RemoteAddr(), err)
 				conn.Close()
 				continue
 			}
 
 			mngr.Router.Send("peer_orchestrator", messaging.Message{
 				SourceId:    mngr.id,
+				ReplyTo:     mngr.id,
 				PayloadType: messaging.PeerConnected,
 				Payload:     messaging.PeerConnectedPayload{Conn: conn},
 				CreatedAt:   time.Now(),
