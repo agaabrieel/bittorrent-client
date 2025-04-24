@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/errors"
 	"github.com/agaabrieel/bittorrent-client/pkg/io"
 	logger "github.com/agaabrieel/bittorrent-client/pkg/logger"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
@@ -54,7 +55,6 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 		ClientId: clientId,
 		Metainfo: meta,
 		Port:     6081,
-		ErrCh:    make(chan error, 1024),
 		RecvCh:   ch,
 		mu:       &sync.Mutex{},
 		wg:       &sync.WaitGroup{},
@@ -64,32 +64,40 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 
 func (mngr *SessionManager) Run(filepath string) {
 
-	Logger, err := logger.NewLogger(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	ErrorHandler, errCh, err := errors.NewErrorHandler()
 	if err != nil {
 		panic(err)
 	}
 
-	TrackerManager, err := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	Logger, err := logger.NewLogger(mngr.Metainfo, mngr.Router, errCh, mngr.ClientId)
+	if err != nil {
+		panic(err)
+	}
+
+	TrackerManager, err := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, errCh, mngr.ClientId)
 	if err != nil {
 		Logger.Fatalf("failed to create tracker manager: %v", err)
 	}
 
-	PeerOrchestrator, err := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	PeerOrchestrator, err := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, errCh, mngr.ClientId)
 	if err != nil {
 		Logger.Fatalf("failed to create peer orchestrator: %v", err)
 	}
 
-	PieceManager, err := piece.NewPieceManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	PieceManager, err := piece.NewPieceManager(mngr.Metainfo, mngr.Router, errCh, mngr.ClientId)
 	if err != nil {
 		Logger.Fatalf("failed to create piece manager: %v", err)
 	}
 
-	IOManager, err := io.NewIOManager(mngr.Metainfo, mngr.Router)
+	IOManager, err := io.NewIOManager(mngr.Metainfo, mngr.Router, errCh)
 	if err != nil {
 		Logger.Fatalf("failed to create io manager: %v", err)
 	}
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
+
+	mngr.wg.Add(1)
+	go ErrorHandler.Run(ctx, mngr.wg)
 
 	mngr.wg.Add(1)
 	go TrackerManager.Run(ctx, mngr.wg)
@@ -116,6 +124,7 @@ func (mngr *SessionManager) Run(filepath string) {
 
 	for {
 		select {
+
 		case <-ctx.Done():
 			Logger.Fatalf("context sent: %v", ctx.Err())
 			ctxCancel()

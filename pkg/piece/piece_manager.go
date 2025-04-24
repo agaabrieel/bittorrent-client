@@ -21,10 +21,11 @@ type PieceManager struct {
 	Metainfo   *metainfo.TorrentMetainfoInfoDict
 	Bitfield   *bitset.BitSet
 	RecvCh     <-chan messaging.Message
+	ErrCh      chan<- error
 	mu         *sync.RWMutex
 }
 
-func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*PieceManager, error) {
+func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*PieceManager, error) {
 
 	id, ch := "piece_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
@@ -43,6 +44,7 @@ func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, client
 		Metainfo:   meta.InfoDict,
 		Bitfield:   bitset.New(uint(bitfieldSize)),
 		RecvCh:     ch,
+		ErrCh:      errCh,
 		mu:         &sync.RWMutex{},
 	}, nil
 }

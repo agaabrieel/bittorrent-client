@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"math/bits"
 	"net"
 	"sync"
@@ -56,9 +55,10 @@ type PeerManager struct {
 	wg              *sync.WaitGroup
 	mu              *sync.RWMutex
 	RecvCh          <-chan messaging.Message
+	ErrorCh         chan<- error
 }
 
-func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr) *PeerManager {
+func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, errCh chan<- error) *PeerManager {
 
 	id, ch := uuid.New().String(), make(chan messaging.Message, 1024)
 
@@ -71,6 +71,7 @@ func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr) *PeerMana
 		mu:       &sync.RWMutex{},
 		wg:       &sync.WaitGroup{},
 		RecvCh:   ch,
+		ErrorCh:  errCh,
 	}
 }
 
@@ -78,17 +79,13 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 
 	defer p.wg.Done()
 
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+
 	// Dials connection
 	conn, err := net.Dial("tcp", p.PeerAddr.String())
 	if err != nil {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: fmt.Sprintf("connection dialing failed: %v", err),
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("connection dialing failed: %v", err)
 		return
 	}
 
@@ -107,19 +104,12 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	Handshake.Write(clientId[:])
 
 	if Handshake.Len() != 68 {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: fmt.Sprintf("incorrect handshake size: expected 68, got %d", Handshake.Len()),
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len())
 		return
 	}
 
 	// Sets write deadline
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := childCtx.Deadline(); ok {
 		conn.SetWriteDeadline(deadline)
 	} else {
 		conn.SetWriteDeadline(time.Now().Add(time.Second * 30))
@@ -130,22 +120,14 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	for writtenBytes < Handshake.Len() {
 		n, err := conn.Write(Handshake.Bytes()[writtenBytes:])
 		if err != nil {
-			p.Router.Send("logger", messaging.Message{
-				SourceId:    p.id,
-				PayloadType: messaging.Error,
-				Payload: messaging.ErrorPayload{
-					Msg: fmt.Sprintf("failed to write to peer: %w", err),
-				},
-				CreatedAt: time.Now(),
-			})
+			p.ErrorCh <- fmt.Errorf("failed to write to peer: %v", err)
 			return
 		}
-
 		writtenBytes += n
 	}
 
 	// Sets read deadline
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := childCtx.Deadline(); ok {
 		conn.SetReadDeadline(deadline)
 	} else {
 		conn.SetReadDeadline(time.Now().Add(time.Second * 30))
@@ -157,53 +139,25 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	for readBytes < len(responseBuffer) {
 		n, err := conn.Read(responseBuffer[readBytes:])
 		if err != nil {
-			p.Router.Send("logger", messaging.Message{
-				SourceId:    p.id,
-				PayloadType: messaging.Error,
-				Payload: messaging.ErrorPayload{
-					Msg: fmt.Sprintf("failed to write to peer: %w", err),
-				},
-				CreatedAt: time.Now(),
-			})
+			p.ErrorCh <- fmt.Errorf("failed to write to peer: %w", err)
 			return
 		}
 		readBytes += n
 	}
 
 	if !bytes.Equal(responseBuffer[0:28], Handshake.Bytes()[:28]) {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: "incorrect handshake",
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("incorrect handshake, expected %v, got %v", responseBuffer[0:28], Handshake.Bytes()[:28])
 		return
 	}
 
 	if !bytes.Equal(responseBuffer[28:48], Handshake.Bytes()[28:48]) {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: "infohash doesn't match",
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("infohash doesn't match, expected %v, got %v", responseBuffer[28:48], Handshake.Bytes()[28:48])
 		return
 	}
 
 	peerID := *(*[20]byte)(responseBuffer[48:68])
 	if p.PeerId != peerID && p.PeerId != [20]byte{} {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: "peer id changed",
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("peer id changed, expected %v, got %v", p.PeerId, peerID)
 		return
 	}
 
@@ -218,14 +172,17 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	p.LastMessage = PeerMessage{}
 
 	p.wg.Add(1)
-	go p.mainLoop(ctx)
+	go p.mainLoop(childCtx)
 }
 
 func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byte, clientId [20]byte) {
 
 	defer p.wg.Done()
 
-	if deadline, ok := ctx.Deadline(); ok {
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+
+	if deadline, ok := childCtx.Deadline(); ok {
 		p.PeerConn.SetReadDeadline(deadline)
 	} else {
 		p.PeerConn.SetReadDeadline(time.Now().Add(time.Second * 30))
@@ -236,14 +193,7 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	for readBytes < len(handshakeBuffer) {
 		n, err := p.PeerConn.Read(handshakeBuffer[readBytes:])
 		if err != nil {
-			p.Router.Send("logger", messaging.Message{
-				SourceId:    p.id,
-				PayloadType: messaging.Error,
-				Payload: messaging.ErrorPayload{
-					Msg: fmt.Sprintf("failed to read from peer: %v", err),
-				},
-				CreatedAt: time.Now(),
-			})
+			p.ErrorCh <- fmt.Errorf("failed to read from peer: %v", err)
 			p.PeerConn.Close()
 			return
 		}
@@ -251,14 +201,7 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	}
 
 	if len(handshakeBuffer) != 68 {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: fmt.Sprintf("incorrect handshake size, expected 68 bytes, got %d", len(handshakeBuffer)),
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("incorrect handshake size, expected 68 bytes, got %d", len(handshakeBuffer))
 		p.PeerConn.Close()
 		return
 	}
@@ -272,27 +215,13 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	handshake.Write(clientId[:])
 
 	if !bytes.Equal(handshakeBuffer[0:28], handshake.Bytes()[:28]) {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: "incorrect handshake",
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("incorrect handshake")
 		p.PeerConn.Close()
 		return
 	}
 
 	if !bytes.Equal(handshakeBuffer[28:48], handshake.Bytes()[28:48]) {
-		p.Router.Send("logger", messaging.Message{
-			SourceId:    p.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: "infohash doesn't match ours",
-			},
-			CreatedAt: time.Now(),
-		})
+		p.ErrorCh <- fmt.Errorf("infohash doesn't match, expected %v, got %v", handshakeBuffer[28:48], handshake.Bytes()[28:48])
 		p.PeerConn.Close()
 		return
 	}
@@ -300,7 +229,7 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	peerID := *(*[20]byte)(handshakeBuffer[48:68])
 
 	// Sets write deadline
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := childCtx.Deadline(); ok {
 		p.PeerConn.SetWriteDeadline(deadline)
 	} else {
 		p.PeerConn.SetWriteDeadline(time.Now().Add(time.Second * 30))
@@ -311,14 +240,7 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	for writtenBytes < handshake.Len() {
 		n, err := p.PeerConn.Write(handshake.Bytes()[writtenBytes:])
 		if err != nil {
-			p.Router.Send("logger", messaging.Message{
-				SourceId:    p.id,
-				PayloadType: messaging.Error,
-				Payload: messaging.ErrorPayload{
-					Msg: fmt.Sprintf("failed to write to peer: %v", err),
-				},
-				CreatedAt: time.Now(),
-			})
+			p.ErrorCh <- fmt.Errorf("failed to write to peer: %v", err)
 			p.PeerConn.Close()
 			return
 		}
@@ -334,7 +256,7 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	p.LastMessage = PeerMessage{}
 
 	p.wg.Add(1)
-	go p.mainLoop(ctx)
+	go p.mainLoop(childCtx)
 
 }
 
@@ -343,6 +265,9 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 	defer p.wg.Done()
 	defer p.PeerConn.Close()
 
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+
 	peerConnRecvCh := make(chan PeerMessage, 1024)
 	peerConnSendCh := make(chan []byte, 1024)
 
@@ -350,14 +275,14 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		go p.writeLoop(ctx, peerConnSendCh)
+		go p.writeLoop(childCtx, peerConnSendCh)
 	}()
 
 	// Reader loop
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		go p.readLoop(ctx, peerConnRecvCh)
+		go p.readLoop(childCtx, peerConnRecvCh)
 	}()
 
 	p.wg.Add(1)
@@ -446,12 +371,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 						payload, ok := msg.Payload.(messaging.BlockSendPayload)
 						if !ok {
-							p.Router.Send("", messaging.Message{
-								PayloadType: messaging.Error,
-								Payload: messaging.ErrorPayload{
-									Msg: "invalid payload type",
-								},
-							})
+							p.ErrorCh <- fmt.Errorf("invalid payload type")
 							return
 						}
 						peerConnSendCh <- payload.Data
@@ -473,10 +393,6 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
 
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
 	var (
 		readBuf bytes.Buffer
 		buf     = make([]byte, 4096)
@@ -497,12 +413,10 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 			n, err := p.PeerConn.Read(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					log.Printf("reading timed-out, closing connection: %v", err)
-					return
-				} else if err == io.EOF {
+					p.ErrorCh <- fmt.Errorf("reading timed-out, closing connection: %v", err)
 					return
 				}
-				log.Printf("read error: %v", err)
+				p.ErrorCh <- fmt.Errorf("read error: %v", err)
 				return
 			}
 
@@ -521,7 +435,7 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 				fullMsg := make([]byte, msgLen)
 				_, err := readBuf.Read(fullMsg)
 				if err != nil {
-					log.Printf("buffer read error: %v", err)
+					p.ErrorCh <- fmt.Errorf("buffer read error: %v", err)
 				}
 
 				if msgLen == 4 {
@@ -545,10 +459,6 @@ func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 	timer := time.NewTimer(120 * time.Second)
 	defer timer.Stop()
 
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
 	for {
 		timer.Reset(120 * time.Second)
 		select {
@@ -568,12 +478,12 @@ func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 				bytesWritten += n
 				if err != nil {
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						log.Printf("write timed-out, closing connection: %v", err)
+						p.ErrorCh <- fmt.Errorf("write timed-out, closing connection: %v", err)
 						return
 					} else if err == io.EOF {
 						return
 					}
-					log.Printf("write error: %v", err)
+					p.ErrorCh <- fmt.Errorf("write error: %v", err)
 					return
 				}
 			}

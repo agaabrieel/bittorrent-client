@@ -6,10 +6,9 @@ import (
 	"fmt"
 	"sync"
 
-	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
-	piece "github.com/agaabrieel/bittorrent-client/pkg/piece"
+	"github.com/bits-and-blooms/bitset"
 )
 
 type PeerOrchestrator struct {
@@ -17,29 +16,30 @@ type PeerOrchestrator struct {
 	Router         *messaging.Router
 	clientId       [20]byte
 	clientInfohash [20]byte
-	AskedBlocks    []piece.Block
-	Bitfield       bitfield.BitfieldMask
+	Bitfield       *bitset.BitSet
 	Mutex          *sync.RWMutex
 	Waitgroup      *sync.WaitGroup
-	SendCh         chan<- messaging.Message
 	RecvCh         <-chan messaging.Message
 	ErrorCh        chan<- error
 }
 
-func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*PeerOrchestrator, error) {
+func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*PeerOrchestrator, error) {
 
 	id, ch := "peer_orchestrator", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
 	if err != nil {
-		return nil, fmt.Errorf("failed to register component with id %w: %v", id, err)
+		return nil, fmt.Errorf("failed to register component with id %s: %v", id, err)
 	}
+
+	bsSize := uint(float64((meta.InfoDict.Length / meta.InfoDict.PieceLength) / 8))
 
 	return &PeerOrchestrator{
 		id:             id,
 		clientId:       clientId,
 		clientInfohash: meta.Infohash,
-		Bitfield:       bitfield.NewBitfield(uint32(float64((meta.InfoDict.Length / meta.InfoDict.PieceLength) / 8))),
+		Bitfield:       bitset.New(bsSize),
 		RecvCh:         ch,
+		ErrorCh:        errCh,
 		Mutex:          &sync.RWMutex{},
 		Waitgroup:      &sync.WaitGroup{},
 	}, nil
@@ -47,16 +47,17 @@ func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, cl
 
 func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 
-	defer wg.Done()
 	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+	defer wg.Done()
 
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
 			switch msg.PayloadType {
-			case messaging.PeerDiscovered:
+			case messaging.PeersDiscovered:
 
-				payload, ok := msg.Payload.(messaging.PeerDiscoveredPayload)
+				payload, ok := msg.Payload.(messaging.PeersDiscoveredPayload)
 				if !ok {
 					mngr.ErrorCh <- errors.New("payload has incorrect type")
 					continue
@@ -65,8 +66,12 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					peerMngr := NewPeerManager(mngr.Router, nil, payload.Addr)
-					go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
+					for _, addr := range payload.Addrs {
+						peerMngr := NewPeerManager(mngr.Router, nil, addr, mngr.ErrorCh)
+						wg.Add(1)
+						defer wg.Done()
+						go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
+					}
 				}()
 
 			case messaging.PeerConnected:
@@ -79,9 +84,25 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr())
+					peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr(), mngr.ErrorCh)
 					go peerMngr.replyToPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
 				}()
+
+			case messaging.PieceValidated:
+				payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
+				if !ok {
+					mngr.ErrorCh <- errors.New("payload has incorrect type")
+					continue
+				}
+
+				wg.Add(1)
+				go func() {
+					mngr.Mutex.Lock()
+					defer mngr.Mutex.Unlock()
+					defer wg.Done()
+					mngr.Bitfield.Set(uint(payload.Index))
+				}()
+
 			}
 
 		case <-ctx.Done():

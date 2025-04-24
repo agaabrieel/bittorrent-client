@@ -13,12 +13,13 @@ import (
 )
 
 type Logger struct {
-	id     string
-	recvCh <-chan messaging.Message
+	id      string
+	recvCh  <-chan messaging.Message
+	errorCh chan<- error
 	*log.Logger
 }
 
-func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*Logger, error) {
+func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*Logger, error) {
 
 	id, ch := "logger", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
@@ -34,9 +35,10 @@ func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20
 	logger := log.New(f, f.Name(), 10111)
 
 	return &Logger{
-		id:     id,
-		recvCh: ch,
-		Logger: logger,
+		id:      id,
+		recvCh:  ch,
+		Logger:  logger,
+		errorCh: errCh,
 	}, nil
 }
 

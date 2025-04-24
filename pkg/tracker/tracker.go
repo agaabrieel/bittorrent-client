@@ -17,7 +17,6 @@ import (
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"
-	peer "github.com/agaabrieel/bittorrent-client/pkg/peers"
 )
 
 const ProtocolID uint64 = 0x41727101980
@@ -57,17 +56,22 @@ type AnnounceRequest struct {
 
 type AnnounceResponse struct {
 	tracker  *Tracker
-	interval time.Duration      // Seconds to wait between announces
-	peers    []peer.PeerManager // List of peers
-	// ... other fields
+	interval time.Duration // Seconds to wait between announces
+	peers    []PeerAddr    // List of peers
 }
 
 type Tracker struct {
 	client
 	url      url.URL
 	interval time.Duration
-	peers    []peer.PeerManager
+	peers    []PeerAddr
 	peerMap  map[[20]byte]bool
+}
+
+type PeerAddr struct {
+	id   [20]byte
+	ip   net.IP
+	port uint16
 }
 
 type TrackerManager struct {
@@ -77,44 +81,43 @@ type TrackerManager struct {
 	ClientId                 [20]byte
 	Metainfo                 *metainfo.TorrentMetainfo
 	RecvCh                   <-chan messaging.Message
+	AnnounceRespCh           chan AnnounceResponse
+	ErrCh                    chan<- error
 	IsWaitingForAnnounceData bool
 	wg                       *sync.WaitGroup
 	mu                       *sync.Mutex
 }
 
-func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*TrackerManager, error) {
+func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*TrackerManager, error) {
 
 	id, ch := "tracker_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
 	if err != nil {
-		return nil, fmt.Errorf("failed to register component with id %w: %v", id, err)
+		return nil, fmt.Errorf("failed to register component with id %v: %v", id, err)
 	}
 
 	return &TrackerManager{
-		id:       id,
-		Tracker:  nil,
-		Router:   r,
-		Metainfo: meta,
-		ClientId: clientId,
-		RecvCh:   ch,
-		wg:       &sync.WaitGroup{},
-		mu:       &sync.Mutex{},
+		id:             id,
+		Tracker:        nil,
+		Router:         r,
+		Metainfo:       meta,
+		ClientId:       clientId,
+		RecvCh:         ch,
+		AnnounceRespCh: make(chan AnnounceResponse, 1),
+		ErrCh:          errCh,
+		wg:             &sync.WaitGroup{},
+		mu:             &sync.Mutex{},
 	}, nil
 }
 
-func (mngr *TrackerManager) setupTracker() {
+func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
+
+	mngr.mu.Lock()
+	defer mngr.mu.Unlock()
 
 	port, err := strconv.Atoi(mngr.Tracker.url.Port())
 	if err != nil {
-		mngr.Router.Send("logger", messaging.Message{
-			SourceId:    mngr.id,
-			PayloadType: messaging.Error,
-			Payload: messaging.ErrorPayload{
-				Msg: "failed to parse tracker port",
-			},
-			CreatedAt: time.Now(),
-		})
-		return
+		return errors.New("failed to parse tracker port")
 	}
 
 	req := AnnounceRequest{
@@ -128,28 +131,24 @@ func (mngr *TrackerManager) setupTracker() {
 	}
 
 	trackerResponseCh := make(chan AnnounceResponse)
+
 	if mngr.Metainfo.AnnounceList == nil {
 
 		trackerUrl, err := url.Parse(mngr.Metainfo.Announce)
 
 		if err != nil {
-			mngr.Router.Send("logger", messaging.Message{
-				SourceId:    mngr.id,
-				PayloadType: messaging.Error,
-				Payload: messaging.ErrorPayload{
-					Msg: "failed to parse announce url",
-				},
-				CreatedAt: time.Now(),
-			})
-			return
+			return errors.New("failed to parse announce url")
+
 		}
 
 		tracker := NewTracker(*trackerUrl)
 
-		mngr.wg.Add(1)
-		go tracker.Announce(mngr.wg, context.Background(), req, trackerResponseCh)
+		childCtx, ctxCancel := context.WithTimeout(ctx, 30*time.Second)
+		defer ctxCancel()
 
-		timer := time.NewTimer(15 * time.Second)
+		mngr.wg.Add(1)
+		go tracker.Announce(childCtx, mngr.wg, req, trackerResponseCh, mngr.ErrCh)
+
 		select {
 		case trackerResponse := <-trackerResponseCh:
 			mngr.wg.Wait()
@@ -159,23 +158,13 @@ func (mngr *TrackerManager) setupTracker() {
 			mngr.Tracker.peers = trackerResponse.peers
 
 			for _, p := range mngr.Tracker.peers {
-				mngr.Tracker.peerMap[p.PeerId] = true
+				mngr.Tracker.peerMap[p.id] = true
 			}
 
-			timer.Stop()
-			break
+			return nil
 
-		case <-timer.C:
-			mngr.Router.Send("logger", messaging.Message{
-				SourceId:    mngr.id,
-				PayloadType: messaging.Error,
-				Payload: messaging.ErrorPayload{
-					Msg: "announcer response timed out",
-				},
-				CreatedAt: time.Now(),
-			})
-			timer.Stop()
-			return
+		case <-ctx.Done():
+			return errors.New("announcer response timed out")
 		}
 
 	} else {
@@ -184,21 +173,22 @@ func (mngr *TrackerManager) setupTracker() {
 
 				trackerUrl, err := url.Parse(tracker)
 				if err != nil {
-					// log
-					//mngr.ErrCh <- errors.New("failed to parse announce URL")
-					return
+					continue
 				}
 
 				tracker := NewTracker(*trackerUrl)
+
+				childCtx, ctxCancel := context.WithTimeout(ctx, 30*time.Second)
+				defer ctxCancel()
+
 				mngr.wg.Add(1)
-				go tracker.Announce(mngr.wg, context.Background(), req, trackerResponseCh)
+				go tracker.Announce(childCtx, mngr.wg, req, trackerResponseCh, mngr.ErrCh)
 			}
 
-			timer := time.NewTimer(15 * time.Second)
 			select {
 			case trackerResponse := <-trackerResponseCh:
+
 				mngr.wg.Wait()
-				timer.Stop()
 				close(trackerResponseCh)
 
 				mngr.Tracker = trackerResponse.tracker
@@ -206,45 +196,52 @@ func (mngr *TrackerManager) setupTracker() {
 				mngr.Tracker.peers = trackerResponse.peers
 
 				for _, p := range mngr.Tracker.peers {
-					mngr.Tracker.peerMap[p.PeerId] = true
+					mngr.Tracker.peerMap[p.id] = true
 				}
 
-			case <-timer.C:
-				timer.Stop()
+			case <-time.After(30 * time.Second):
 				continue
+			case <-ctx.Done():
+				return nil
 			}
 		}
 	}
+	return nil
 }
 
 func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
+
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
 	defer wg.Done()
 
-	mngr.setupTracker()
-	for _, peer := range mngr.Tracker.peers {
-		mngr.SendCh <- messaging.DirectedMessage{
-			MessageType: messaging.NewPeerFromTracker,
-			Data:        peer,
-		}
+	err := mngr.setupTracker(childCtx)
+	if err != nil {
+		mngr.ErrCh <- fmt.Errorf("failed to setup tracker: %v", err)
+		return
 	}
 
-	lastIterTime := time.Now()
-	for {
+	for _, peerAddr := range mngr.Tracker.peers {
+		mngr.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    mngr.id,
+			ReplyTo:     mngr.id,
+			PayloadType: messaging.PeersDiscovered,
+			Payload:     peerAddr,
+			CreatedAt:   time.Now(),
+		})
+	}
 
-		var timer time.Timer
-		if mngr.Tracker.interval != 0 {
-			mngr.Tracker.interval = mngr.Tracker.interval - time.Since(lastIterTime)
-			timer = *time.NewTimer(mngr.Tracker.interval)
-		} else {
-			timer = *time.NewTimer(0)
-		}
+	trackerInterval := time.NewTimer(mngr.Tracker.interval)
+	for {
 
 		select {
 		case msg := <-mngr.RecvCh:
-			switch msg.MessageType {
-			case messaging.AnnounceDataResponse:
 
-				payload, ok := msg.Data.(messaging.AnnounceDataResponseData)
+			switch msg.PayloadType {
+
+			case messaging.AnnounceDataSend:
+
+				payload, ok := msg.Payload.(messaging.AnnounceDataSendPayload)
 				if !ok {
 					mngr.ErrCh <- errors.New("router sent wrong datatype, aborting")
 					return
@@ -265,39 +262,54 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					left:       payload.Left,
 					event:      payload.Event,
 				}
-				go mngr.Tracker.Announce(&mngr.wg, ctx, req, mngr.AnnounceResponseCh, mngr.ErrCh)
+
+				mngr.wg.Add(1)
+				go mngr.Tracker.Announce(childCtx, mngr.wg, req, mngr.AnnounceRespCh, mngr.ErrCh)
 			}
 
-		case msg := <-mngr.AnnounceResponseCh:
+		case msg := <-mngr.AnnounceRespCh:
 
 			mngr.IsWaitingForAnnounceData = false
-			mngr.Tracker.interval = msg.interval
+			trackerInterval.Reset(msg.interval)
 
+			newPeers := make([]net.Addr, 256)
 			for _, peer := range msg.peers {
-				if !mngr.Tracker.peerMap[peer.PeerId] {
-					mngr.SendCh <- messaging.DirectedMessage{
-						MessageType: messaging.NewPeerFromTracker,
-						Data:        peer,
-					}
+				if !mngr.Tracker.peerMap[peer.id] {
+
+					mngr.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    mngr.id,
+						ReplyTo:     mngr.id,
+						PayloadType: messaging.PeersDiscovered,
+						Payload:     newPeers,
+						CreatedAt:   time.Now(),
+					})
+
 					mngr.Tracker.peers = append(mngr.Tracker.peers, peer)
-					mngr.Tracker.peerMap[peer.PeerId] = true
+					mngr.Tracker.peerMap[peer.id] = true
 				}
 			}
 
-		case <-timer.C:
+		case <-trackerInterval.C:
+
 			if !mngr.IsWaitingForAnnounceData {
-				mngr.SendCh <- messaging.DirectedMessage{
-					MessageType: messaging.AnnounceDataRequest,
-					Data:        nil,
-				}
+
+				mngr.Router.Send("", messaging.Message{
+					SourceId:    mngr.id,
+					ReplyTo:     mngr.id,
+					PayloadType: messaging.AnnounceDataRequest,
+					Payload:     nil,
+					CreatedAt:   time.Now(),
+				})
+
+				mngr.IsWaitingForAnnounceData = true
+
 			}
+
+		case <-ctx.Done():
+			ctxCancel()
+			return
 		}
-
-		lastIterTime = time.Now()
-		timer.Stop()
-
 	}
-
 }
 
 func NewTracker(trackerUrl url.URL) Tracker {
@@ -326,24 +338,27 @@ func NewTracker(trackerUrl url.URL) Tracker {
 	}
 }
 
-func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req AnnounceRequest, respCh chan<- AnnounceResponse) {
+func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req AnnounceRequest, respCh chan<- AnnounceResponse, errCh chan<- error) {
 
 	defer wg.Done()
 
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+
 	if t.client == nil {
-		// errCh <- errors.New("tracker does not implement client")
+		errCh <- errors.New("tracker does not implement client")
 		return
 	}
 
-	resp, err := t.client.Announce(ctx, t.url, req)
+	resp, err := t.client.Announce(childCtx, t.url, req)
 	if err != nil {
-		// errCh <- fmt.Errorf("failed tracker announce: %w", err)
+		errCh <- fmt.Errorf("failed tracker announce: %w", err)
 	}
 
 	if resp.interval > 0 {
 		t.interval = resp.interval
 	} else {
-		t.interval = time.Second * 30
+		t.interval = time.Second * 600
 	}
 
 	resp.tracker = t
@@ -352,6 +367,9 @@ func (t *Tracker) Announce(wg *sync.WaitGroup, ctx context.Context, req Announce
 }
 
 func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error) {
+
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
 
 	var announceResp AnnounceResponse
 
@@ -364,7 +382,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 		return AnnounceResponse{}, fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
 
-	conn, err := c.dialer.DialContext(ctx, "udp", serverAddr.String())
+	conn, err := c.dialer.DialContext(childCtx, "udp", serverAddr.String())
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to connect to tracker: %w", err)
 	}
@@ -376,7 +394,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 
 	if found { // IF CONNECTION ID ALREADY EXISTS, SKIP CONNECTION REQUEST
 		connId := cachedConnId
-		announceResp, err = c.makeAnnounceRequest(ctx, connId, req, conn)
+		announceResp, err = c.makeAnnounceRequest(childCtx, connId, req, conn)
 		if err != nil {
 			err = fmt.Errorf("failed to make announce request: %w", err)
 			errors.Join(err, errors.New("connection id may have expired, retrying"))
@@ -392,7 +410,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 		}
 	}
 
-	connId, err := c.makeConnectionRequest(ctx, conn)
+	connId, err := c.makeConnectionRequest(childCtx, conn)
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to make connection request: %w", err)
 	}
@@ -401,7 +419,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 	c.connIds[trackerUrl.Host] = connId
 	c.mutex.Unlock()
 
-	announceResp, err = c.makeAnnounceRequest(ctx, connId, req, conn)
+	announceResp, err = c.makeAnnounceRequest(childCtx, connId, req, conn)
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to make announce request: %w", err)
 	}
@@ -411,6 +429,9 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 }
 
 func (c *HTTPClient) Announce(ctx context.Context, trackerUrl url.URL, req AnnounceRequest) (AnnounceResponse, error) {
+
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
 
 	if c.client == nil {
 		return AnnounceResponse{}, errors.New("tracker client is nil")
@@ -438,7 +459,7 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerUrl url.URL, req Annou
 	finalUrl := trackerUrl
 	finalUrl.RawQuery = params.Encode()
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, finalUrl.String(), nil)
+	httpReq, err := http.NewRequestWithContext(childCtx, http.MethodGet, finalUrl.String(), nil)
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to create request context: %w", err)
 	}
@@ -474,6 +495,9 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerUrl url.URL, req Annou
 
 func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req AnnounceRequest, conn net.Conn) (AnnounceResponse, error) {
 
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+
 	var announceTransactionIDBytes [4]byte
 	if _, err := io.ReadFull(rand.Reader, announceTransactionIDBytes[:]); err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to generate announce transaction ID: %w", err)
@@ -482,7 +506,7 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 
 	announceMsg := c.generateAnnounceMsg(announceTransactionId, req, connId)
 
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := childCtx.Deadline(); ok {
 		conn.SetWriteDeadline(deadline)
 	} else {
 		conn.SetWriteDeadline(time.Now().Add(15 * time.Second))
@@ -497,7 +521,7 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 		return AnnounceResponse{}, fmt.Errorf("wrote %d bytes, expected 98 bytes", n)
 	}
 
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := childCtx.Deadline(); ok {
 		conn.SetReadDeadline(deadline)
 	} else {
 		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -548,16 +572,16 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 	}
 
 	var announceResp AnnounceResponse
-	announceResp.peers = make([]peer.PeerManager, 0, numPeers)
+	announceResp.peers = make([]PeerAddr, 0, numPeers)
 	announceResp.interval = time.Duration(binary.BigEndian.Uint32(announceBuffer[8:12])) * time.Second
 
 	for i := range numPeers {
 		offset := i * 6
 		ip := net.IP(peerData[offset : offset+4])
 		port := binary.BigEndian.Uint16(peerData[offset+4 : offset+6])
-		announceResp.peers = append(announceResp.peers, peer.PeerManager{
-			PeerIp:   ip,
-			PeerPort: port,
+		announceResp.peers = append(announceResp.peers, PeerAddr{
+			ip:   ip,
+			port: port,
 		})
 	}
 
@@ -566,6 +590,9 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 
 func (c *UDPClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (uint64, error) {
 
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+
 	msg := make([]byte, 16) // creates buffer for connect  message
 
 	var connectTransactionId uint32
@@ -573,7 +600,7 @@ func (c *UDPClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (u
 	binary.BigEndian.PutUint32(msg[8:12], uint32(ConnectAction))
 	binary.BigEndian.PutUint32(msg[12:16], connectTransactionId)
 
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := childCtx.Deadline(); ok {
 		conn.SetWriteDeadline(deadline)
 	} else {
 		conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
@@ -588,7 +615,7 @@ func (c *UDPClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (u
 		return 0, fmt.Errorf("udp tracker wrote %d bytes, expected 16", n)
 	}
 
-	if deadline, ok := ctx.Deadline(); ok {
+	if deadline, ok := childCtx.Deadline(); ok {
 		conn.SetReadDeadline(deadline)
 	} else {
 		conn.SetReadDeadline(time.Now().Add(15 * time.Second))
@@ -631,19 +658,6 @@ func (c *UDPClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (u
 
 func (c *UDPClient) generateAnnounceMsg(transactionId uint32, req AnnounceRequest, connId uint64) []byte {
 
-	announceMsg := make([]byte, 98)
-
-	binary.BigEndian.PutUint64(announceMsg[0:8], connId)
-	binary.BigEndian.PutUint32(announceMsg[8:12], uint32(AnnounceAction))
-
-	binary.BigEndian.PutUint32(announceMsg[12:16], transactionId)
-	copy(announceMsg[16:36], req.infoHash[:])
-	copy(announceMsg[36:56], req.peerID[:])
-
-	binary.BigEndian.PutUint64(announceMsg[56:64], req.downloaded)
-	binary.BigEndian.PutUint64(announceMsg[64:72], req.left)
-	binary.BigEndian.PutUint64(announceMsg[72:80], req.uploaded)
-
 	var eventCode uint32 = 0 // Default: none
 	switch req.event {
 	case "completed":
@@ -654,8 +668,17 @@ func (c *UDPClient) generateAnnounceMsg(transactionId uint32, req AnnounceReques
 		eventCode = 3
 	}
 
-	binary.BigEndian.PutUint64(announceMsg[80:84], uint64(eventCode))
+	announceMsg := make([]byte, 98)
 
+	binary.BigEndian.PutUint64(announceMsg[0:8], connId)
+	binary.BigEndian.PutUint32(announceMsg[8:12], uint32(AnnounceAction))
+	binary.BigEndian.PutUint32(announceMsg[12:16], transactionId)
+	copy(announceMsg[16:36], req.infoHash[:])
+	copy(announceMsg[36:56], req.peerID[:])
+	binary.BigEndian.PutUint64(announceMsg[56:64], req.downloaded)
+	binary.BigEndian.PutUint64(announceMsg[64:72], req.left)
+	binary.BigEndian.PutUint64(announceMsg[72:80], req.uploaded)
+	binary.BigEndian.PutUint64(announceMsg[80:84], uint64(eventCode))
 	binary.BigEndian.PutUint32(announceMsg[84:88], 0)
 	binary.BigEndian.PutUint32(announceMsg[88:92], 0)
 	binary.BigEndian.PutUint32(announceMsg[92:96], 0xFFFFFFFF) // -1 as an uint32
@@ -705,16 +728,16 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 					ip := net.ParseIP(string(entry.Value.StringValue[i : i+4]))
 					port := binary.BigEndian.Uint16(entry.Value.StringValue[i+4 : i+6])
 
-					resp.peers = append(resp.peers, peer.PeerManager{
-						PeerIp:   ip,
-						PeerPort: port,
+					resp.peers = append(resp.peers, PeerAddr{
+						ip:   ip,
+						port: port,
 					})
 				}
 
 			} else {
 				for _, peerDict := range entry.Value.ListValue {
 
-					var peer peer.PeerManager
+					var peerAddr PeerAddr
 					for _, entry := range peerDict.DictValue {
 
 						k, err := entry.Key.GetStringValue()
@@ -724,17 +747,17 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 
 						switch k {
 						case "peer id":
-							peer.PeerId = [20]byte(entry.Key.StringValue)
+							peerAddr.id = [20]byte(entry.Key.StringValue)
 							continue
 						case "ip":
-							peer.PeerIp = net.ParseIP(string(entry.Value.StringValue))
+							peerAddr.ip = net.ParseIP(string(entry.Value.StringValue))
 							continue
 						case "port":
-							peer.PeerPort = uint16(entry.Value.IntegerValue)
+							peerAddr.port = uint16(entry.Value.IntegerValue)
 							continue
 						}
 					}
-					resp.peers = append(resp.peers, peer)
+					resp.peers = append(resp.peers, peerAddr)
 
 				}
 			}

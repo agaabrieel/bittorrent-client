@@ -12,7 +12,9 @@ const (
 	BlockSend
 	PieceRequest
 	PieceSend
-	PeerDiscovered
+	AnnounceDataRequest
+	AnnounceDataSend
+	PeersDiscovered
 	PeerConnected
 	PieceValidated
 	Error
@@ -65,8 +67,8 @@ type AnnounceDataSendPayload struct {
 	Event      string
 }
 
-type PeerDiscoveredPayload struct {
-	Addr net.Addr
+type PeersDiscoveredPayload struct {
+	Addrs []net.Addr
 }
 
 type PeerConnectedPayload struct {

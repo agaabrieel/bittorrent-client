@@ -19,11 +19,12 @@ type IOManager struct {
 	FileSize  int64
 	PieceSize int64
 	RecvCh    <-chan messaging.Message
+	ErrCh     chan<- error
 	mu        *sync.RWMutex
 	wg        *sync.WaitGroup
 }
 
-func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router) (*IOManager, error) {
+func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error) (*IOManager, error) {
 
 	id, ch := "io_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
@@ -48,6 +49,7 @@ func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router) (*IOManag
 		PieceSize: int64(meta.InfoDict.PieceLength),
 		FileSize:  int64(meta.InfoDict.Length),
 		RecvCh:    ch,
+		ErrCh:     errCh,
 		mu:        &sync.RWMutex{},
 		wg:        &sync.WaitGroup{},
 	}, nil
