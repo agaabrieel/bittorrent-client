@@ -62,6 +62,10 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 
 }
 
+// TODO:
+// 1. IMPLEMENT ERROR HANDLING
+// 2. IMPLEMENT PEER MANAGER MAIN LOOP
+
 func (mngr *SessionManager) Run(filepath string) {
 
 	ErrorHandler, errCh, err := errors.NewErrorHandler()
@@ -76,31 +80,32 @@ func (mngr *SessionManager) Run(filepath string) {
 
 	TrackerManager, err := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, errCh, mngr.ClientId)
 	if err != nil {
-		Logger.Fatalf("failed to create tracker manager: %v", err)
+		Logger.Panicf("failed to create tracker manager: %v", err)
 	}
 
 	PeerOrchestrator, err := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, errCh, mngr.ClientId)
 	if err != nil {
-		Logger.Fatalf("failed to create peer orchestrator: %v", err)
+		Logger.Panicf("failed to create peer orchestrator: %v", err)
 	}
 
 	PieceManager, err := piece.NewPieceManager(mngr.Metainfo, mngr.Router, errCh, mngr.ClientId)
 	if err != nil {
-		Logger.Fatalf("failed to create piece manager: %v", err)
+		Logger.Panicf("failed to create piece manager: %v", err)
 	}
 
 	IOManager, err := io.NewIOManager(mngr.Metainfo, mngr.Router, errCh)
 	if err != nil {
-		Logger.Fatalf("failed to create io manager: %v", err)
+		Logger.Panicf("failed to create io manager: %v", err)
 	}
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
+	defer ctxCancel()
+
+	mngr.wg.Add(1)
+	go Logger.Run(ctx, mngr.wg)
 
 	mngr.wg.Add(1)
 	go ErrorHandler.Run(ctx, mngr.wg)
-
-	mngr.wg.Add(1)
-	go TrackerManager.Run(ctx, mngr.wg)
 
 	mngr.wg.Add(1)
 	go PeerOrchestrator.Run(ctx, mngr.wg)
@@ -112,38 +117,30 @@ func (mngr *SessionManager) Run(filepath string) {
 	go IOManager.Run(ctx, mngr.wg)
 
 	mngr.wg.Add(1)
-	go Logger.Run(ctx, mngr.wg)
+	go TrackerManager.Run(ctx, mngr.wg)
 
 	defer mngr.wg.Wait()
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(mngr.Port)))
 	if err != nil {
-		panic(err)
+		Logger.Panicf("failed to create io manager: %v", err)
 	}
 	defer listener.Close()
 
 	for {
-		select {
-
-		case <-ctx.Done():
-			Logger.Fatalf("context sent: %v", ctx.Err())
-			ctxCancel()
-
-		default:
-			conn, err := listener.Accept()
-			if err != nil {
-				Logger.Printf("connection from %v failed: %v", conn.RemoteAddr(), err)
-				conn.Close()
-				continue
-			}
-
-			mngr.Router.Send("peer_orchestrator", messaging.Message{
-				SourceId:    mngr.id,
-				ReplyTo:     mngr.id,
-				PayloadType: messaging.PeerConnected,
-				Payload:     messaging.PeerConnectedPayload{Conn: conn},
-				CreatedAt:   time.Now(),
-			})
+		conn, err := listener.Accept()
+		if err != nil {
+			Logger.Printf("connection from %v failed: %v", conn.RemoteAddr(), err)
+			conn.Close()
+			continue
 		}
+
+		mngr.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    mngr.id,
+			ReplyTo:     mngr.id,
+			PayloadType: messaging.PeerConnected,
+			Payload:     messaging.PeerConnectedPayload{Conn: conn},
+			CreatedAt:   time.Now(),
+		})
 	}
 }

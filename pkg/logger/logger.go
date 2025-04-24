@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
@@ -53,8 +52,7 @@ func (l *Logger) Run(ctx context.Context, wg *sync.WaitGroup) {
 			l.Printf("Message of type %v sent by %s at %v, expected reply to %s. Payload is: %+v", msg.PayloadType, msg.SourceId, msg.CreatedAt, msg.ReplyTo, msg.Payload)
 		case <-ctx.Done():
 			ctxCancel()
-		default:
-			time.Sleep(500)
+			return
 		}
 	}
 }

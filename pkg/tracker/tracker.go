@@ -110,6 +110,109 @@ func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errC
 	}, nil
 }
 
+func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
+
+	childCtx, ctxCancel := context.WithCancel(ctx)
+	defer ctxCancel()
+	defer wg.Done()
+
+	err := mngr.setupTracker(childCtx)
+	if err != nil {
+		mngr.ErrCh <- fmt.Errorf("failed to setup tracker: %w", err)
+		return
+	}
+
+	for _, peerAddr := range mngr.Tracker.peers {
+		mngr.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    mngr.id,
+			ReplyTo:     mngr.id,
+			PayloadType: messaging.PeersDiscovered,
+			Payload:     peerAddr,
+			CreatedAt:   time.Now(),
+		})
+	}
+
+	trackerInterval := time.NewTimer(mngr.Tracker.interval)
+	for {
+
+		select {
+		case msg := <-mngr.RecvCh:
+
+			switch msg.PayloadType {
+
+			case messaging.AnnounceDataSend:
+
+				payload, ok := msg.Payload.(messaging.AnnounceDataSendPayload)
+				if !ok {
+					mngr.ErrCh <- errors.New("router sent wrong datatype, aborting")
+					return
+				}
+
+				port, err := strconv.Atoi(mngr.Tracker.url.Port())
+				if err != nil {
+					mngr.ErrCh <- errors.New("failed to parse tracker port, aborting")
+					return
+				}
+
+				req := AnnounceRequest{
+					infoHash:   mngr.Metainfo.Infohash,
+					peerID:     mngr.ClientId,
+					port:       uint16(port),
+					uploaded:   payload.Uploaded,
+					downloaded: payload.Downloaded,
+					left:       payload.Left,
+					event:      payload.Event,
+				}
+
+				mngr.wg.Add(1)
+				go mngr.Tracker.Announce(childCtx, mngr.wg, req, mngr.AnnounceRespCh, mngr.ErrCh)
+			}
+
+		case msg := <-mngr.AnnounceRespCh:
+
+			mngr.IsWaitingForAnnounceData = false
+			trackerInterval.Reset(msg.interval)
+
+			newPeers := make([]net.Addr, 256)
+			for _, peer := range msg.peers {
+				if !mngr.Tracker.peerMap[peer.id] {
+
+					mngr.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    mngr.id,
+						ReplyTo:     mngr.id,
+						PayloadType: messaging.PeersDiscovered,
+						Payload:     newPeers,
+						CreatedAt:   time.Now(),
+					})
+
+					mngr.Tracker.peers = append(mngr.Tracker.peers, peer)
+					mngr.Tracker.peerMap[peer.id] = true
+				}
+			}
+
+		case <-trackerInterval.C:
+
+			if !mngr.IsWaitingForAnnounceData {
+
+				mngr.Router.Send("", messaging.Message{
+					SourceId:    mngr.id,
+					ReplyTo:     mngr.id,
+					PayloadType: messaging.AnnounceDataRequest,
+					Payload:     nil,
+					CreatedAt:   time.Now(),
+				})
+
+				mngr.IsWaitingForAnnounceData = true
+
+			}
+
+		case <-ctx.Done():
+			ctxCancel()
+			return
+		}
+	}
+}
+
 func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 
 	mngr.mu.Lock()
@@ -207,109 +310,6 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 		}
 	}
 	return nil
-}
-
-func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
-
-	childCtx, ctxCancel := context.WithCancel(ctx)
-	defer ctxCancel()
-	defer wg.Done()
-
-	err := mngr.setupTracker(childCtx)
-	if err != nil {
-		mngr.ErrCh <- fmt.Errorf("failed to setup tracker: %v", err)
-		return
-	}
-
-	for _, peerAddr := range mngr.Tracker.peers {
-		mngr.Router.Send("peer_orchestrator", messaging.Message{
-			SourceId:    mngr.id,
-			ReplyTo:     mngr.id,
-			PayloadType: messaging.PeersDiscovered,
-			Payload:     peerAddr,
-			CreatedAt:   time.Now(),
-		})
-	}
-
-	trackerInterval := time.NewTimer(mngr.Tracker.interval)
-	for {
-
-		select {
-		case msg := <-mngr.RecvCh:
-
-			switch msg.PayloadType {
-
-			case messaging.AnnounceDataSend:
-
-				payload, ok := msg.Payload.(messaging.AnnounceDataSendPayload)
-				if !ok {
-					mngr.ErrCh <- errors.New("router sent wrong datatype, aborting")
-					return
-				}
-
-				port, err := strconv.Atoi(mngr.Tracker.url.Port())
-				if err != nil {
-					mngr.ErrCh <- errors.New("failed to parse tracker port, aborting")
-					return
-				}
-
-				req := AnnounceRequest{
-					infoHash:   mngr.Metainfo.Infohash,
-					peerID:     mngr.ClientId,
-					port:       uint16(port),
-					uploaded:   payload.Uploaded,
-					downloaded: payload.Downloaded,
-					left:       payload.Left,
-					event:      payload.Event,
-				}
-
-				mngr.wg.Add(1)
-				go mngr.Tracker.Announce(childCtx, mngr.wg, req, mngr.AnnounceRespCh, mngr.ErrCh)
-			}
-
-		case msg := <-mngr.AnnounceRespCh:
-
-			mngr.IsWaitingForAnnounceData = false
-			trackerInterval.Reset(msg.interval)
-
-			newPeers := make([]net.Addr, 256)
-			for _, peer := range msg.peers {
-				if !mngr.Tracker.peerMap[peer.id] {
-
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						ReplyTo:     mngr.id,
-						PayloadType: messaging.PeersDiscovered,
-						Payload:     newPeers,
-						CreatedAt:   time.Now(),
-					})
-
-					mngr.Tracker.peers = append(mngr.Tracker.peers, peer)
-					mngr.Tracker.peerMap[peer.id] = true
-				}
-			}
-
-		case <-trackerInterval.C:
-
-			if !mngr.IsWaitingForAnnounceData {
-
-				mngr.Router.Send("", messaging.Message{
-					SourceId:    mngr.id,
-					ReplyTo:     mngr.id,
-					PayloadType: messaging.AnnounceDataRequest,
-					Payload:     nil,
-					CreatedAt:   time.Now(),
-				})
-
-				mngr.IsWaitingForAnnounceData = true
-
-			}
-
-		case <-ctx.Done():
-			ctxCancel()
-			return
-		}
-	}
 }
 
 func NewTracker(trackerUrl url.URL) Tracker {

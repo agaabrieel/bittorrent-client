@@ -30,8 +30,6 @@ func (h *ErrorHandler) Run(ctx context.Context, wg *sync.WaitGroup) {
 			// handle error
 		case <-ctx.Done():
 			ctxCancel()
-		default:
-			// default?
 		}
 	}
 }
