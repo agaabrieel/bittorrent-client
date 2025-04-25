@@ -1,6 +1,8 @@
 ./*:Zone.Identifier
 ./*.iso.torrent
 ./*.bin
+./*.txt
+./*.log
 *.torrent
 *.txt
 *.log
