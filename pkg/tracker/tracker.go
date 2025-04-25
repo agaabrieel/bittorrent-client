@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"
@@ -82,13 +83,13 @@ type TrackerManager struct {
 	Metainfo                 *metainfo.TorrentMetainfo
 	RecvCh                   <-chan messaging.Message
 	AnnounceRespCh           chan AnnounceResponse
-	ErrCh                    chan<- error
+	ErrCh                    chan<- apperrors.Error
 	IsWaitingForAnnounceData bool
 	wg                       *sync.WaitGroup
 	mu                       *sync.Mutex
 }
 
-func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*TrackerManager, error) {
+func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error, clientId [20]byte) (*TrackerManager, error) {
 
 	id, ch := "tracker_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
@@ -118,7 +119,13 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 	err := mngr.setupTracker(childCtx)
 	if err != nil {
-		mngr.ErrCh <- fmt.Errorf("failed to setup tracker: %w", err)
+		mngr.ErrCh <- apperrors.Error{
+			Err:         err,
+			Message:     "failed to setup tracker",
+			Severity:    apperrors.Critical,
+			Time:        time.Now(),
+			ComponentId: "tracker_manager",
+		}
 		return
 	}
 
@@ -144,13 +151,25 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 				payload, ok := msg.Payload.(messaging.AnnounceDataSendPayload)
 				if !ok {
-					mngr.ErrCh <- errors.New("router sent wrong datatype, aborting")
+					mngr.ErrCh <- apperrors.Error{
+						Err:         err,
+						Message:     "router sent wrong datatype",
+						Severity:    apperrors.Critical,
+						Time:        time.Now(),
+						ComponentId: "tracker_manager",
+					}
 					return
 				}
 
 				port, err := strconv.Atoi(mngr.Tracker.url.Port())
 				if err != nil {
-					mngr.ErrCh <- errors.New("failed to parse tracker port, aborting")
+					mngr.ErrCh <- apperrors.Error{
+						Err:         err,
+						Message:     "failed to parse tracker port",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: "tracker_manager",
+					}
 					return
 				}
 

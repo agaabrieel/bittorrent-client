@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 )
@@ -14,11 +15,11 @@ import (
 type Logger struct {
 	id      string
 	recvCh  <-chan messaging.Message
-	errorCh chan<- error
+	errorCh chan<- apperrors.Error
 	*log.Logger
 }
 
-func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*Logger, error) {
+func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error, clientId [20]byte) (*Logger, error) {
 
 	id, ch := "logger", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
