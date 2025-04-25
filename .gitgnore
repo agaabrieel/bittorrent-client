@@ -2,3 +2,5 @@
 ./*.iso.torrent
 ./*.bin
 *.torrent
+*.txt
+*.log
