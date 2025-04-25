@@ -2,7 +2,6 @@ package log
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"sync"
@@ -27,7 +26,7 @@ func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<-
 		return nil, err
 	}
 
-	f, err := os.Create(fmt.Sprintf("log-%s-%s.txt", clientId, meta.Infohash))
+	f, err := os.Create("log-*.txt")
 	if err != nil {
 		return nil, err
 	}

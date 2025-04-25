@@ -237,15 +237,10 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 	mngr.mu.Lock()
 	defer mngr.mu.Unlock()
 
-	port, err := strconv.Atoi(mngr.Tracker.url.Port())
-	if err != nil {
-		return errors.New("failed to parse tracker port")
-	}
-
 	req := AnnounceRequest{
 		infoHash:   mngr.Metainfo.Infohash,
 		peerID:     mngr.ClientId,
-		port:       uint16(port),
+		port:       0,
 		uploaded:   0, // READ FROM MSG
 		downloaded: 0, // READ FROM MSG
 		left:       mngr.Metainfo.InfoDict.Length,
@@ -267,6 +262,13 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 
 		childCtx, ctxCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer ctxCancel()
+
+		port, err := strconv.Atoi(trackerUrl.Port())
+		if err != nil {
+			return errors.New("failed to parse tracker port")
+		}
+
+		req.port = uint16(port)
 
 		mngr.wg.Add(1)
 		go tracker.Announce(childCtx, mngr.wg, req, trackerResponseCh, mngr.ErrCh)
@@ -302,6 +304,13 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 
 				childCtx, ctxCancel := context.WithTimeout(ctx, 30*time.Second)
 				defer ctxCancel()
+
+				port, err := strconv.Atoi(trackerUrl.Port())
+				if err != nil {
+					return errors.New("failed to parse tracker port")
+				}
+
+				req.port = uint16(port)
 
 				mngr.wg.Add(1)
 				go tracker.Announce(childCtx, mngr.wg, req, trackerResponseCh, mngr.ErrCh)
