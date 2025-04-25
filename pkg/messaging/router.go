@@ -32,12 +32,7 @@ func (r *Router) Send(destId string, msg Message) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	//if msg.PayloadType == Error && destId == "error" {
-	//	if err, ok := msg.Payload.(ErrorPayload); ok {
-	//		r.Logger.Print(err.Msg)
-	//	}
-	//	return
-	//}
+	r.Registry["logger"] <- msg
 
 	if ch, ok := r.Registry[destId]; ok {
 		select {

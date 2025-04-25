@@ -52,7 +52,7 @@ func (h *ErrorHandler) Run(wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	for msg := range h.RecvCh {
-		h.Logger.Printf("[%v] %v: %v (id=%v)", msg.Severity, msg.Err.Error(), msg.Message, msg.ComponentId)
+		h.Logger.Printf("[%+v] %v: %v (id=%v)", msg.Severity, msg.Err.Error(), msg.Message, msg.ComponentId)
 		if msg.Severity == Critical {
 			h.ContextCancelFunc()
 			return

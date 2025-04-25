@@ -348,6 +348,7 @@ func NewTracker(trackerUrl url.URL) Tracker {
 			dialer: &net.Dialer{
 				Timeout: time.Duration(time.Second * 45),
 			},
+			connIds: make(map[string]uint64),
 		}
 	} else if trackerUrl.Scheme == "http" || trackerUrl.Scheme == "https" {
 		tc = &HTTPClient{
@@ -417,7 +418,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl url.URL, req Announ
 		return AnnounceResponse{}, fmt.Errorf("client has no valid dialer")
 	}
 
-	serverAddr, err := net.ResolveUDPAddr("udp", trackerUrl.String())
+	serverAddr, err := net.ResolveUDPAddr("udp", trackerUrl.Host)
 	if err != nil {
 		return AnnounceResponse{}, fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
@@ -698,7 +699,7 @@ func (c *UDPClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (u
 
 func (c *UDPClient) generateAnnounceMsg(transactionId uint32, req AnnounceRequest, connId uint64) []byte {
 
-	var eventCode uint32 = 0 // Default: none
+	var eventCode uint64 = 0 // Default: none
 	switch req.event {
 	case "completed":
 		eventCode = 1
