@@ -11,7 +11,7 @@ import (
 
 	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	"github.com/agaabrieel/bittorrent-client/pkg/io"
-	logger "github.com/agaabrieel/bittorrent-client/pkg/logger"
+	logger "github.com/agaabrieel/bittorrent-client/pkg/log"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	peer "github.com/agaabrieel/bittorrent-client/pkg/peers"
