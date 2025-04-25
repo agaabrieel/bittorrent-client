@@ -64,7 +64,7 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 // TODO:
 // 1. IMPLEMENT PEER MANAGER MAIN LOOP
 
-func (mngr *SessionManager) Run(filepath string) {
+func (mngr *SessionManager) Run() {
 
 	ctx, ctxCancel := context.WithCancel(context.Background())
 	defer ctxCancel()
