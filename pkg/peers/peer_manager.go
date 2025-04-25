@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math/bits"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/google/uuid"
@@ -55,10 +57,10 @@ type PeerManager struct {
 	wg              *sync.WaitGroup
 	mu              *sync.RWMutex
 	RecvCh          <-chan messaging.Message
-	ErrorCh         chan<- error
+	ErrorCh         chan<- apperrors.Error
 }
 
-func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, errCh chan<- error) *PeerManager {
+func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, errCh chan<- apperrors.Error) *PeerManager {
 
 	id, ch := uuid.New().String(), make(chan messaging.Message, 1024)
 
@@ -85,7 +87,13 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	// Dials connection
 	conn, err := net.Dial("tcp", p.PeerAddr.String())
 	if err != nil {
-		p.ErrorCh <- fmt.Errorf("connection dialing failed: %v", err)
+		p.ErrorCh <- apperrors.Error{
+			Err:         err,
+			Message:     "connection dialing failed",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		return
 	}
 
@@ -104,7 +112,13 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	Handshake.Write(clientId[:])
 
 	if Handshake.Len() != 68 {
-		p.ErrorCh <- fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len())
+		p.ErrorCh <- apperrors.Error{
+			Err:         fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len()),
+			Message:     "incorrect handshake size",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		return
 	}
 
@@ -120,7 +134,13 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	for writtenBytes < Handshake.Len() {
 		n, err := conn.Write(Handshake.Bytes()[writtenBytes:])
 		if err != nil {
-			p.ErrorCh <- fmt.Errorf("failed to write to peer: %v", err)
+			p.ErrorCh <- apperrors.Error{
+				Err:         err,
+				Message:     "failed to write to peer",
+				Severity:    apperrors.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			}
 			return
 		}
 		writtenBytes += n
@@ -139,25 +159,49 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	for readBytes < len(responseBuffer) {
 		n, err := conn.Read(responseBuffer[readBytes:])
 		if err != nil {
-			p.ErrorCh <- fmt.Errorf("failed to write to peer: %w", err)
+			p.ErrorCh <- apperrors.Error{
+				Err:         err,
+				Message:     "failed to write to peer",
+				Severity:    apperrors.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			}
 			return
 		}
 		readBytes += n
 	}
 
 	if !bytes.Equal(responseBuffer[0:28], Handshake.Bytes()[:28]) {
-		p.ErrorCh <- fmt.Errorf("incorrect handshake, expected %v, got %v", responseBuffer[0:28], Handshake.Bytes()[:28])
+		p.ErrorCh <- apperrors.Error{
+			Err:         fmt.Errorf("incorrect handshake, expected %v, got %v", responseBuffer[0:28], Handshake.Bytes()[:28]),
+			Message:     "failed to write to peer",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		return
 	}
 
 	if !bytes.Equal(responseBuffer[28:48], Handshake.Bytes()[28:48]) {
-		p.ErrorCh <- fmt.Errorf("infohash doesn't match, expected %v, got %v", responseBuffer[28:48], Handshake.Bytes()[28:48])
+		p.ErrorCh <- apperrors.Error{
+			Err:         fmt.Errorf("infohash doesn't match, expected %v, got %v", responseBuffer[28:48], Handshake.Bytes()[28:48]),
+			Message:     "failed to write to peer",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		return
 	}
 
 	peerID := *(*[20]byte)(responseBuffer[48:68])
 	if p.PeerId != peerID && p.PeerId != [20]byte{} {
-		p.ErrorCh <- fmt.Errorf("peer id changed, expected %v, got %v", p.PeerId, peerID)
+		p.ErrorCh <- apperrors.Error{
+			Err:         fmt.Errorf("peer id changed, expected %v, got %v", p.PeerId, peerID),
+			Message:     "failed to write to peer",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		return
 	}
 
@@ -193,7 +237,13 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	for readBytes < len(handshakeBuffer) {
 		n, err := p.PeerConn.Read(handshakeBuffer[readBytes:])
 		if err != nil {
-			p.ErrorCh <- fmt.Errorf("failed to read from peer: %v", err)
+			p.ErrorCh <- apperrors.Error{
+				Err:         err,
+				Message:     "failed to read from peer",
+				Severity:    apperrors.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			}
 			p.PeerConn.Close()
 			return
 		}
@@ -201,7 +251,13 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	}
 
 	if len(handshakeBuffer) != 68 {
-		p.ErrorCh <- fmt.Errorf("incorrect handshake size, expected 68 bytes, got %d", len(handshakeBuffer))
+		p.ErrorCh <- apperrors.Error{
+			Err:         fmt.Errorf("incorrect handshake size, got %d", len(handshakeBuffer)),
+			Message:     "failed to establish a connection with a peer",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		p.PeerConn.Close()
 		return
 	}
@@ -215,13 +271,25 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	handshake.Write(clientId[:])
 
 	if !bytes.Equal(handshakeBuffer[0:28], handshake.Bytes()[:28]) {
-		p.ErrorCh <- fmt.Errorf("incorrect handshake")
+		p.ErrorCh <- apperrors.Error{
+			Err:         fmt.Errorf("incorrect handshake"),
+			Message:     "failed to establish a connection with a peer",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		p.PeerConn.Close()
 		return
 	}
 
 	if !bytes.Equal(handshakeBuffer[28:48], handshake.Bytes()[28:48]) {
-		p.ErrorCh <- fmt.Errorf("infohash doesn't match, expected %v, got %v", handshakeBuffer[28:48], handshake.Bytes()[28:48])
+		p.ErrorCh <- apperrors.Error{
+			Err:         fmt.Errorf("infohash doesn't match, expected %v, got %v", handshakeBuffer[28:48], handshake.Bytes()[28:48]),
+			Message:     "failed to write to peer",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
 		p.PeerConn.Close()
 		return
 	}
@@ -240,7 +308,13 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	for writtenBytes < handshake.Len() {
 		n, err := p.PeerConn.Write(handshake.Bytes()[writtenBytes:])
 		if err != nil {
-			p.ErrorCh <- fmt.Errorf("failed to write to peer: %v", err)
+			p.ErrorCh <- apperrors.Error{
+				Err:         err,
+				Message:     "failed writing to socket",
+				Severity:    apperrors.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			}
 			p.PeerConn.Close()
 			return
 		}
@@ -371,7 +445,13 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 						payload, ok := msg.Payload.(messaging.BlockSendPayload)
 						if !ok {
-							p.ErrorCh <- fmt.Errorf("invalid payload type")
+							p.ErrorCh <- apperrors.Error{
+								Err:         errors.New("incorrect payload"),
+								Message:     "incorrect payload",
+								Severity:    apperrors.Warning,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							}
 							return
 						}
 						peerConnSendCh <- payload.Data
@@ -413,10 +493,22 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 			n, err := p.PeerConn.Read(buf)
 			if err != nil {
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					p.ErrorCh <- fmt.Errorf("reading timed-out, closing connection: %v", err)
+					p.ErrorCh <- apperrors.Error{
+						Err:         err,
+						Message:     "reading timed-out, closing connection",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: p.id,
+					}
 					return
 				}
-				p.ErrorCh <- fmt.Errorf("read error: %v", err)
+				p.ErrorCh <- apperrors.Error{
+					Err:         err,
+					Message:     "read error",
+					Severity:    apperrors.Warning,
+					Time:        time.Now(),
+					ComponentId: p.id,
+				}
 				return
 			}
 
@@ -435,7 +527,13 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 				fullMsg := make([]byte, msgLen)
 				_, err := readBuf.Read(fullMsg)
 				if err != nil {
-					p.ErrorCh <- fmt.Errorf("buffer read error: %v", err)
+					p.ErrorCh <- apperrors.Error{
+						Err:         err,
+						Message:     "buffer read error",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: p.id,
+					}
 				}
 
 				if msgLen == 4 {
@@ -477,13 +575,28 @@ func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 				n, err := p.PeerConn.Write(msg[bytesWritten:])
 				bytesWritten += n
 				if err != nil {
+
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						p.ErrorCh <- fmt.Errorf("write timed-out, closing connection: %v", err)
+						p.ErrorCh <- apperrors.Error{
+							Err:         err,
+							Message:     "write timed out",
+							Severity:    apperrors.Warning,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						}
 						return
+
 					} else if err == io.EOF {
 						return
 					}
-					p.ErrorCh <- fmt.Errorf("write error: %v", err)
+
+					p.ErrorCh <- apperrors.Error{
+						Err:         err,
+						Message:     "write error",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: p.id,
+					}
 					return
 				}
 			}

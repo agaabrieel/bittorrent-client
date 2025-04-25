@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	"github.com/bits-and-blooms/bitset"
@@ -20,10 +22,10 @@ type PeerOrchestrator struct {
 	Mutex          *sync.RWMutex
 	Waitgroup      *sync.WaitGroup
 	RecvCh         <-chan messaging.Message
-	ErrorCh        chan<- error
+	ErrorCh        chan<- apperrors.Error
 }
 
-func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*PeerOrchestrator, error) {
+func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error, clientId [20]byte) (*PeerOrchestrator, error) {
 
 	id, ch := "peer_orchestrator", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
@@ -59,7 +61,13 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 				payload, ok := msg.Payload.(messaging.PeersDiscoveredPayload)
 				if !ok {
-					mngr.ErrorCh <- errors.New("payload has incorrect type")
+					mngr.ErrorCh <- apperrors.Error{
+						Err:         errors.New("incorrect payload"),
+						Message:     "incorrect payload",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
 					continue
 				}
 
@@ -77,7 +85,13 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 			case messaging.PeerConnected:
 				payload, ok := msg.Payload.(messaging.PeerConnectedPayload)
 				if !ok {
-					mngr.ErrorCh <- errors.New("payload has incorrect type")
+					mngr.ErrorCh <- apperrors.Error{
+						Err:         errors.New("incorrect payload"),
+						Message:     "incorrect payload",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
 					continue
 				}
 
@@ -91,7 +105,13 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 			case messaging.PieceValidated:
 				payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
 				if !ok {
-					mngr.ErrorCh <- errors.New("payload has incorrect type")
+					mngr.ErrorCh <- apperrors.Error{
+						Err:         errors.New("incorrect payload"),
+						Message:     "incorrect payload",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
 					continue
 				}
 

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 )
@@ -19,12 +20,12 @@ type IOManager struct {
 	FileSize  int64
 	PieceSize int64
 	RecvCh    <-chan messaging.Message
-	ErrCh     chan<- error
+	ErrCh     chan<- apperrors.Error
 	mu        *sync.RWMutex
 	wg        *sync.WaitGroup
 }
 
-func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error) (*IOManager, error) {
+func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error) (*IOManager, error) {
 
 	id, ch := "io_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)

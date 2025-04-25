@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	bitset "github.com/bits-and-blooms/bitset"
@@ -21,11 +22,11 @@ type PieceManager struct {
 	Metainfo   *metainfo.TorrentMetainfoInfoDict
 	Bitfield   *bitset.BitSet
 	RecvCh     <-chan messaging.Message
-	ErrCh      chan<- error
+	ErrCh      chan<- apperrors.Error
 	mu         *sync.RWMutex
 }
 
-func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- error, clientId [20]byte) (*PieceManager, error) {
+func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error, clientId [20]byte) (*PieceManager, error) {
 
 	id, ch := "piece_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)

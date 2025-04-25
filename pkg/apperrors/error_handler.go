@@ -22,30 +22,28 @@ type Error struct {
 }
 
 type ErrorHandler struct {
-	RecvCh <-chan Error
+	RecvCh            <-chan Error
+	ContextCancelFunc context.CancelFunc
 }
 
-func NewErrorHandler() (*ErrorHandler, chan<- Error, error) {
+func NewErrorHandler(ctxCancelFunc context.CancelFunc) (*ErrorHandler, chan<- Error, error) {
 
 	errCh := make(chan Error, 2056)
 
 	return &ErrorHandler{
-		RecvCh: errCh,
+		RecvCh:            errCh,
+		ContextCancelFunc: ctxCancelFunc,
 	}, errCh, nil
 }
 
-func (h *ErrorHandler) Run(ctx context.Context, wg *sync.WaitGroup) {
+func (h *ErrorHandler) Run(wg *sync.WaitGroup) {
 
 	defer wg.Done()
-	_, ctxCancel := context.WithCancel(ctx)
 
-	for {
-		select {
-		case msg := <-h.RecvCh:
-			println(msg)
-			// handle error
-		case <-ctx.Done():
-			ctxCancel()
+	for msg := range h.RecvCh {
+		if msg.Severity == Critical {
+			h.ContextCancelFunc()
+			return
 		}
 	}
 }

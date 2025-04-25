@@ -357,7 +357,7 @@ func NewTracker(trackerUrl url.URL) Tracker {
 	}
 }
 
-func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req AnnounceRequest, respCh chan<- AnnounceResponse, errCh chan<- error) {
+func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req AnnounceRequest, respCh chan<- AnnounceResponse, errCh chan<- apperrors.Error) {
 
 	defer wg.Done()
 
@@ -365,13 +365,25 @@ func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req Announce
 	defer ctxCancel()
 
 	if t.client == nil {
-		errCh <- errors.New("tracker does not implement client")
+		errCh <- apperrors.Error{
+			Err:         fmt.Errorf("tracker does not implement client"),
+			Message:     "tracker does not implement client",
+			Severity:    apperrors.Critical,
+			Time:        time.Now(),
+			ComponentId: "tracker_manager",
+		}
 		return
 	}
 
 	resp, err := t.client.Announce(childCtx, t.url, req)
 	if err != nil {
-		errCh <- fmt.Errorf("failed tracker announce: %w", err)
+		errCh <- apperrors.Error{
+			Err:         err,
+			Message:     "failed tracker announce",
+			Severity:    apperrors.Critical,
+			Time:        time.Now(),
+			ComponentId: "tracker_manager",
+		}
 	}
 
 	if resp.interval > 0 {

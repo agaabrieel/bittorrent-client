@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agaabrieel/bittorrent-client/pkg/errors"
+	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	"github.com/agaabrieel/bittorrent-client/pkg/io"
 	logger "github.com/agaabrieel/bittorrent-client/pkg/logger"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
@@ -20,16 +20,15 @@ import (
 )
 
 type SessionManager struct {
-	id               string
-	Router           *messaging.Router
-	ClientId         [20]byte
-	Port             int
-	Metainfo         *metainfo.TorrentMetainfo
-	RecvCh           <-chan messaging.Message
-	ErrCh            chan error
-	wg               *sync.WaitGroup
-	mu               *sync.Mutex
-	coreComponentIds []string
+	id       string
+	Router   *messaging.Router
+	ClientId [20]byte
+	Port     int
+	Metainfo *metainfo.TorrentMetainfo
+	RecvCh   <-chan messaging.Message
+	ErrCh    chan error
+	wg       *sync.WaitGroup
+	mu       *sync.Mutex
 }
 
 func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, error) {
@@ -63,12 +62,14 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 }
 
 // TODO:
-// 1. IMPLEMENT ERROR HANDLING
-// 2. IMPLEMENT PEER MANAGER MAIN LOOP
+// 1. IMPLEMENT PEER MANAGER MAIN LOOP
 
 func (mngr *SessionManager) Run(filepath string) {
 
-	ErrorHandler, errCh, err := errors.NewErrorHandler()
+	ctx, ctxCancel := context.WithCancel(context.Background())
+	defer ctxCancel()
+
+	ErrorHandler, errCh, err := apperrors.NewErrorHandler(ctxCancel)
 	if err != nil {
 		panic(err)
 	}
@@ -98,14 +99,11 @@ func (mngr *SessionManager) Run(filepath string) {
 		Logger.Panicf("failed to create io manager: %v", err)
 	}
 
-	ctx, ctxCancel := context.WithCancel(context.Background())
-	defer ctxCancel()
+	mngr.wg.Add(1)
+	go ErrorHandler.Run(mngr.wg)
 
 	mngr.wg.Add(1)
 	go Logger.Run(ctx, mngr.wg)
-
-	mngr.wg.Add(1)
-	go ErrorHandler.Run(ctx, mngr.wg)
 
 	mngr.wg.Add(1)
 	go PeerOrchestrator.Run(ctx, mngr.wg)
@@ -130,7 +128,13 @@ func (mngr *SessionManager) Run(filepath string) {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			Logger.Printf("connection from %v failed: %v", conn.RemoteAddr(), err)
+			errCh <- apperrors.Error{
+				Err:         err,
+				Message:     "listener timed-out",
+				Severity:    apperrors.Warning,
+				ComponentId: "session_manager",
+				Time:        time.Now(),
+			}
 			conn.Close()
 			continue
 		}
