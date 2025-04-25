@@ -7,14 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/bits"
 	"net"
 	"sync"
 	"time"
 
 	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
-	bitfield "github.com/agaabrieel/bittorrent-client/pkg/bitfield"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
+	"github.com/bits-and-blooms/bitset"
 	"github.com/google/uuid"
 )
 
@@ -46,7 +45,8 @@ type PeerManager struct {
 	PeerId          [20]byte
 	PeerConn        net.Conn
 	PeerAddr        net.Addr
-	PeerBitfield    bitfield.BitfieldMask
+	PeerBitfield    *bitset.BitSet
+	OurBitfield     *bitset.BitSet
 	IsInterested    bool
 	IsInteresting   bool
 	IsChoked        bool
@@ -359,9 +359,22 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 		go p.readLoop(childCtx, peerConnRecvCh)
 	}()
 
+	bitfieldMsg, err := generateBitfieldMsg(*p.OurBitfield)
+	if err != nil {
+		p.ErrorCh <- apperrors.Error{
+			Err:         err,
+			Message:     "failed to send bitfield message",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: p.id,
+		}
+		return
+	}
+
+	peerConnSendCh <- bitfieldMsg
 	p.wg.Add(1)
 	go func() {
-		// Msg processing loop
+		// PEER MESSAGE LISTENER
 		defer p.wg.Done()
 		for {
 			select {
@@ -392,10 +405,16 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						p.IsInterested = true
 
 					case Bitfield:
-						p.PeerBitfield = msg.data
-						wantedPieces := p.PeerBitfield
 
-						if len(wantedPieces) != 0 {
+						bs := make([]uint64, len(msg.data)/8)
+						for i := range len(bs) {
+							bs[i] = binary.BigEndian.Uint64(msg.data[0+i*8 : 8+i*8])
+						}
+
+						p.PeerBitfield = bitset.From(bs)
+						wantedPieces := p.PeerBitfield.Difference(p.OurBitfield)
+
+						if wantedPieces.Any() {
 							if !p.IsInteresting {
 								peerConnSendCh <- generateNoPayloadMsg(Interested)
 								p.IsInteresting = true
@@ -406,10 +425,12 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						}
 
 					case Have:
-						p.PeerBitfield.SetPiece(binary.BigEndian.Uint32(msg.data[5:]))
-						wantedPieces := 1
 
-						if wantedPieces != 0 {
+						p.PeerBitfield.Set(uint(binary.BigEndian.Uint32(msg.data[5:])))
+
+						wantedPieces := p.PeerBitfield.Difference(p.OurBitfield)
+
+						if wantedPieces.Any() {
 							if !p.IsInteresting {
 								peerConnSendCh <- generateNoPayloadMsg(Interested)
 								p.IsInteresting = true
@@ -421,7 +442,32 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 					case Request:
 
+						p.Router.Send("piece_manager", messaging.Message{
+							SourceId:    p.id,
+							ReplyTo:     p.id,
+							PayloadType: messaging.BlockRequest,
+							Payload: messaging.BlockRequestPayload{
+								Index:  binary.BigEndian.Uint32(msg.data[5:9]),
+								Offset: binary.BigEndian.Uint32(msg.data[9:13]),
+								Size:   binary.BigEndian.Uint32(msg.data[13:17]),
+							},
+							CreatedAt: time.Now(),
+						})
+
 					case Piece:
+
+						p.Router.Send("piece_manager", messaging.Message{
+							SourceId:    p.id,
+							ReplyTo:     p.id,
+							PayloadType: messaging.BlockSend,
+							Payload: messaging.BlockSendPayload{
+								Index:  binary.BigEndian.Uint32(msg.data[5:9]),
+								Offset: binary.BigEndian.Uint32(msg.data[9:13]),
+								Size:   uint32(len(msg.data[13:])),
+								Data:   msg.data[13:],
+							},
+							CreatedAt: time.Now(),
+						})
 
 					}
 				}()
@@ -431,7 +477,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 	p.wg.Add(1)
 	go func() {
-		// Reply loop
+		// ROUTER LISTENING LOOP
 		defer p.wg.Done()
 		for {
 			select {
@@ -447,14 +493,42 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						if !ok {
 							p.ErrorCh <- apperrors.Error{
 								Err:         errors.New("incorrect payload"),
-								Message:     "incorrect payload",
+								Message:     fmt.Sprintf("expected BlockSendPayload, got %v", payload),
 								Severity:    apperrors.Warning,
 								Time:        time.Now(),
 								ComponentId: p.id,
 							}
 							return
 						}
-						peerConnSendCh <- payload.Data
+
+						if p.IsInterested && !p.IsChoking {
+							peerConnSendCh <- generatePieceMsg(payload.Index, payload.Offset, payload.Data)
+						} else {
+							p.ErrorCh <- apperrors.Error{
+								Err:         errors.New("peer is not interested or is choking"),
+								Message:     fmt.Sprintf("dropping message %v", payload),
+								Severity:    apperrors.Warning,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							}
+						}
+					case messaging.PieceValidated:
+
+						payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
+						if !ok {
+
+							p.ErrorCh <- apperrors.Error{
+								Err:         errors.New("incorrect payload"),
+								Message:     fmt.Sprintf("expected PieceValidatedPayload, got %v", payload),
+								Severity:    apperrors.Warning,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							}
+						}
+						p.mu.Lock()
+						p.OurBitfield.Set(uint(payload.Index))
+						peerConnSendCh <- generateHaveMsg(payload.Index)
+						p.mu.Unlock()
 
 					default:
 						// LOG STUFF
@@ -464,6 +538,23 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 			}
 		}
 
+	}()
+
+	p.wg.Add(1)
+	go func() {
+		// PIECE REQUEST LOOP
+		defer p.wg.Done()
+		for {
+			select {
+			case <-ctx.Done():
+				// stuff
+				return
+			default:
+				if p.IsInteresting && !p.IsChoking {
+					peerConnSendCh <- generateRequestMsg(uint32(10), uint32(10), uint32(10))
+				}
+			}
+		}
 	}()
 
 }
@@ -638,29 +729,26 @@ func generateRequestMsg(idx uint32, offset uint32, len uint32) []byte {
 	return buf
 }
 
-func generateBitfieldMsg(bf bitfield.BitfieldMask) []byte {
-	buf := make([]byte, len(bf)+5)
-	binary.BigEndian.PutUint32(buf, uint32(len(bf)+1))
+func generateBitfieldMsg(bf bitset.BitSet) ([]byte, error) {
+	buf := make([]byte, bf.Len()+5)
+	binary.BigEndian.PutUint32(buf, uint32(bf.Len()+1))
 	buf[4] = byte(Bitfield)
-	copy(buf[5:], bf)
-	return buf
+
+	binarySet, err := bf.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+
+	copy(buf[5:], binarySet)
+	return buf, nil
 }
 
 func generatePieceMsg(idx uint32, offset uint32, data []byte) []byte {
 	buf := make([]byte, len(data)+13)
 	binary.BigEndian.PutUint32(buf, uint32(len(data)+9))
 	buf[4] = byte(Piece)
-	copy(buf[5:], data)
+	binary.BigEndian.PutUint32(buf[5:9], idx)
+	binary.BigEndian.PutUint32(buf[9:13], offset)
+	copy(buf[13:], data)
 	return buf
-}
-
-func findFirstNonZeroBit(bytes []byte) int {
-	for i, byte := range bytes {
-		if byte == 0 {
-			continue
-		}
-		bitIdx := bits.Len(uint(byte)) - 1
-		return i + bitIdx
-	}
-	return -1
 }

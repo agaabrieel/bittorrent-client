@@ -32,7 +32,7 @@ func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<-
 		return nil, err
 	}
 
-	logger := log.New(f, f.Name(), 10111)
+	logger := log.New(f, "[INFO]", 10111)
 
 	return &Logger{
 		id:      id,
