@@ -11,14 +11,31 @@ import (
 type ErrorSeverity uint8
 
 const (
-	Warning ErrorSeverity = iota
+	Info ErrorSeverity = iota
+	Warning
 	Critical
+)
+
+type ErrorCode uint8
+
+const (
+	ErrCodeContextCancelled ErrorCode = iota
+	ErrCodeInvalidMessage
+	ErrCodeInvalidPayload
+	ErrCodeInvalidBlock
+	ErrCodeInvalidConnection
+	ErrCodeInvalidTracker
+	ErrCodeInvalidPiece
+	ErrCodeInvalidRequest
+	ErrCodeInvalidResponse
+	ErrCodeInvalidFile
 )
 
 type Error struct {
 	Err         error
 	Message     string
 	Severity    ErrorSeverity
+	ErrorCode   ErrorCode
 	Time        time.Time
 	ComponentId string
 }

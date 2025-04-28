@@ -53,7 +53,7 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 		Router:   messaging.NewRouter(),
 		ClientId: clientId,
 		Metainfo: meta,
-		Port:     6081,
+		Port:     6881,
 		RecvCh:   ch,
 		mu:       &sync.Mutex{},
 		wg:       &sync.WaitGroup{},
@@ -125,26 +125,29 @@ func (mngr *SessionManager) Run() {
 	}
 	defer listener.Close()
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			errCh <- apperrors.Error{
-				Err:         err,
-				Message:     "listener timed-out",
-				Severity:    apperrors.Warning,
-				ComponentId: "session_manager",
-				Time:        time.Now(),
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				errCh <- apperrors.Error{
+					Err:         err,
+					Message:     "listener failed (timeout, closed, etc)",
+					Severity:    apperrors.Critical,
+					ErrorCode:   apperrors.ErrCodeInvalidConnection,
+					ComponentId: "session_manager",
+					Time:        time.Now(),
+				}
+				return
 			}
-			conn.Close()
-			continue
-		}
 
-		mngr.Router.Send("peer_orchestrator", messaging.Message{
-			SourceId:    mngr.id,
-			ReplyTo:     mngr.id,
-			PayloadType: messaging.PeerConnected,
-			Payload:     messaging.PeerConnectedPayload{Conn: conn},
-			CreatedAt:   time.Now(),
-		})
-	}
+			mngr.Router.Send("peer_orchestrator", messaging.Message{
+				SourceId:    mngr.id,
+				ReplyTo:     mngr.id,
+				PayloadType: messaging.PeerConnected,
+				Payload:     messaging.PeerConnectedPayload{Conn: conn},
+				CreatedAt:   time.Now(),
+			})
+		}
+	}()
+	<-ctx.Done()
 }

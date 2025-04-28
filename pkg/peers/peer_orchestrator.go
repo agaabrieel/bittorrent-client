@@ -63,8 +63,9 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 				if !ok {
 					mngr.ErrorCh <- apperrors.Error{
 						Err:         errors.New("incorrect payload"),
-						Message:     "incorrect payload",
+						Message:     fmt.Sprintf("incorrect payload: %v", msg),
 						Severity:    apperrors.Warning,
+						ErrorCode:   apperrors.ErrCodeInvalidPayload,
 						Time:        time.Now(),
 						ComponentId: mngr.id,
 					}
@@ -87,7 +88,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 				if !ok {
 					mngr.ErrorCh <- apperrors.Error{
 						Err:         errors.New("incorrect payload"),
-						Message:     "incorrect payload",
+						Message:     fmt.Sprintf("incorrect payload: %v", msg),
 						Severity:    apperrors.Warning,
 						Time:        time.Now(),
 						ComponentId: mngr.id,
@@ -126,7 +127,6 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 
 		case <-ctx.Done():
-			ctxCancel()
 			return // should add logging here
 		}
 	}

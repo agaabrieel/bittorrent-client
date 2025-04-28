@@ -6,3 +6,9 @@
 *.torrent
 *.txt
 *.log
+./.vscode
+*.json
+.vscode/launch.json
+*.log
+errors.log
+log-*.txt

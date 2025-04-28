@@ -52,8 +52,11 @@ func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh 
 
 func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
-	defer wg.Wait()
+	defer wg.Done()
 	defer mngr.PieceCache.Cleanup()
+
+	childCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	for {
 		select {
@@ -66,7 +69,7 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					// LOG/RETURN/WHATEVER
 					return
 				}
-				go mngr.processBlockRequest(msg)
+				go mngr.processBlockRequest(childCtx, msg)
 			case messaging.BlockSend:
 				_, ok := msg.Payload.(messaging.BlockSendPayload)
 				if !ok {
@@ -74,16 +77,13 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					// log, whatever
 					return
 				}
-				go mngr.processBlockSend(msg)
+				go mngr.processBlockSend(childCtx, msg)
 			default:
 				// LOG, WHATEVER
 			}
 
 		case <-ctx.Done():
 			return
-
-		default:
-			// LOG, WHATEVER
 		}
 	}
 }
@@ -94,103 +94,146 @@ func (mngr *PieceManager) pickNextPiece() {
 func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 }
 
-func (mngr *PieceManager) processBlockRequest(msg messaging.Message) {
+func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging.Message) {
 
-	var blockData []byte
-	var err error
+	resultChan := make(chan bool)
 
-	mngr.mu.Lock()
-	defer mngr.mu.Unlock()
+	go func() {
 
-	data, ok := msg.Payload.(messaging.BlockRequestPayload)
-	if !ok {
-		// log
-		return
-	}
+		var blockData []byte
+		var err error
 
-	mngr.PieceCache.mu.Lock()
-	defer mngr.PieceCache.mu.Unlock()
+		mngr.mu.Lock()
+		defer mngr.mu.Unlock()
 
-	blockData, err = mngr.PieceCache.GetBlock(data.Index, data.Offset, data.Size)
-	if err != nil {
+		data, ok := msg.Payload.(messaging.BlockRequestPayload)
+		if !ok {
+			// log
+			return
+		}
 
-		mngr.Router.Send(msg.ReplyTo, messaging.Message{
-			SourceId:    mngr.id,
-			ReplyTo:     mngr.id,
-			PayloadType: messaging.BlockSend,
-			Payload: messaging.BlockSendPayload{
-				Index:  data.Index,
-				Offset: data.Offset,
-				Size:   uint32(len(blockData)),
-				Data:   blockData,
-			},
-			CreatedAt: time.Now(),
-		})
+		mngr.PieceCache.mu.Lock()
+		defer mngr.PieceCache.mu.Unlock()
 
-	} else {
-
-		mngr.Router.Send("io_manager", messaging.Message{
-			SourceId:    mngr.id,
-			ReplyTo:     msg.ReplyTo,
-			PayloadType: messaging.BlockRequest,
-			Payload: messaging.BlockRequestPayload{
-				Index:  data.Index,
-				Offset: data.Offset,
-				Size:   data.Size,
-			},
-			CreatedAt: time.Now(),
-		})
-
-	}
-}
-
-func (mngr *PieceManager) processBlockSend(msg messaging.Message) {
-
-	mngr.mu.Lock()
-	defer mngr.mu.Unlock()
-
-	data, ok := msg.Payload.(messaging.BlockSendPayload)
-	if !ok {
-		// log
-		return
-	}
-
-	mngr.PieceCache.mu.Lock()
-	defer mngr.PieceCache.mu.Unlock()
-
-	mngr.PieceCache.PutBlock(data.Data, data.Index, data.Offset)
-
-	if isComplete, err := mngr.PieceCache.isPieceComplete(data.Index, uint32(mngr.Metainfo.PieceLength)); isComplete && err != nil && mngr.validatePiece(data.Index) {
-
-		piece, err := mngr.PieceCache.GetPiece(data.Index)
+		blockData, err = mngr.PieceCache.GetBlock(data.Index, data.Offset, data.Size)
 		if err != nil {
+
+			mngr.Router.Send(msg.ReplyTo, messaging.Message{
+				SourceId:    mngr.id,
+				ReplyTo:     mngr.id,
+				PayloadType: messaging.BlockSend,
+				Payload: messaging.BlockSendPayload{
+					Index:  data.Index,
+					Offset: data.Offset,
+					Size:   uint32(len(blockData)),
+					Data:   blockData,
+				},
+				CreatedAt: time.Now(),
+			})
+
+		} else {
+
+			mngr.Router.Send("io_manager", messaging.Message{
+				SourceId:    mngr.id,
+				ReplyTo:     msg.ReplyTo,
+				PayloadType: messaging.BlockRequest,
+				Payload: messaging.BlockRequestPayload{
+					Index:  data.Index,
+					Offset: data.Offset,
+					Size:   data.Size,
+				},
+				CreatedAt: time.Now(),
+			})
 
 		}
 
-		mngr.Bitfield.Set(uint(data.Index))
+		resultChan <- true
+	}()
 
-		mngr.Router.Broadcast(messaging.Message{
-			SourceId:    mngr.id,
-			ReplyTo:     mngr.id,
-			PayloadType: messaging.PieceValidated,
-			Payload: messaging.PieceValidatedPayload{
-				Index: data.Index,
-			},
-			CreatedAt: time.Now(),
-		})
+	select {
+	case <-resultChan:
+		return
+	case <-ctx.Done():
+		mngr.ErrCh <- apperrors.Error{
+			Err:         fmt.Errorf("context cancelled"),
+			Message:     "context cancelled",
+			ErrorCode:   apperrors.ErrCodeContextCancelled,
+			ComponentId: "processBlockRequestGoroutine",
+			Time:        time.Now(),
+			Severity:    apperrors.Info,
+		}
+		return
+	}
 
-		mngr.Router.Send("io_manager", messaging.Message{
-			SourceId:    mngr.id,
-			ReplyTo:     mngr.id,
-			PayloadType: messaging.PieceSend,
-			Payload: messaging.PieceSendPayload{
-				Index: data.Index,
-				Size:  uint32(len(piece.Blocks)),
-				Data:  piece.Blocks,
-			},
-			CreatedAt: time.Now(),
-		})
+}
 
+func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Message) {
+
+	resultChan := make(chan bool)
+	go func() {
+
+		mngr.mu.Lock()
+		defer mngr.mu.Unlock()
+
+		data, ok := msg.Payload.(messaging.BlockSendPayload)
+		if !ok {
+			// log
+			return
+		}
+
+		mngr.PieceCache.mu.Lock()
+		defer mngr.PieceCache.mu.Unlock()
+
+		mngr.PieceCache.PutBlock(data.Data, data.Index, data.Offset)
+
+		if isComplete, err := mngr.PieceCache.isPieceComplete(data.Index, uint32(mngr.Metainfo.PieceLength)); isComplete && err != nil && mngr.validatePiece(data.Index) {
+
+			piece, err := mngr.PieceCache.GetPiece(data.Index)
+			if err != nil {
+
+			}
+
+			mngr.Bitfield.Set(uint(data.Index))
+
+			mngr.Router.Broadcast(messaging.Message{
+				SourceId:    mngr.id,
+				ReplyTo:     mngr.id,
+				PayloadType: messaging.PieceValidated,
+				Payload: messaging.PieceValidatedPayload{
+					Index: data.Index,
+				},
+				CreatedAt: time.Now(),
+			})
+
+			mngr.Router.Send("io_manager", messaging.Message{
+				SourceId:    mngr.id,
+				ReplyTo:     mngr.id,
+				PayloadType: messaging.PieceSend,
+				Payload: messaging.PieceSendPayload{
+					Index: data.Index,
+					Size:  uint32(len(piece.Blocks)),
+					Data:  piece.Blocks,
+				},
+				CreatedAt: time.Now(),
+			})
+
+		}
+		resultChan <- true
+	}()
+
+	select {
+	case <-resultChan:
+		return
+	case <-ctx.Done():
+		mngr.ErrCh <- apperrors.Error{
+			Err:         fmt.Errorf("context cancelled"),
+			Message:     "context cancelled",
+			ErrorCode:   apperrors.ErrCodeContextCancelled,
+			ComponentId: "processBlockSendGoroutine",
+			Time:        time.Now(),
+			Severity:    apperrors.Info,
+		}
+		return
 	}
 }
 
