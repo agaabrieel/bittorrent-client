@@ -3,6 +3,7 @@ package metainfo
 import (
 	"crypto/sha1"
 	"fmt"
+	"strings"
 
 	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"
 )
@@ -83,15 +84,21 @@ func (t *TorrentMetainfo) Deserialize(filepath string) error {
 			tierlists := entry.Value.ListValue
 			for _, tierList := range tierlists {
 
+				if len(tierList.ListValue) == 0 {
+					continue
+				}
+
 				tier := tierList.ListValue
 				urls := make([]string, len(tier))
+
 				for _, urlValue := range tier {
 
 					url, err := urlValue.GetStringValue()
 					if err != nil {
 						return fmt.Errorf("invalid url: %w", err)
 					}
-					urls = append(urls, string(url))
+					url = strings.Trim(url, "\n \t")
+					urls = append(urls, url)
 				}
 
 				t.AnnounceList = append(t.AnnounceList, urls)

@@ -252,9 +252,6 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 
 	trackerResponseCh := make(chan AnnounceResponse, 1)
 
-	fmt.Printf("Tracker URL: %+v\n", mngr.Metainfo.Announce)
-	fmt.Printf("Tracker URLs: %+v\n", mngr.Metainfo.AnnounceList)
-
 	if mngr.Metainfo.AnnounceList == nil {
 
 		trackerUrl, err := url.Parse(mngr.Metainfo.Announce)
@@ -305,7 +302,14 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 
 	} else {
 		for _, trackers := range mngr.Metainfo.AnnounceList {
+			fmt.Printf("Trackers URL: %+v\n", trackers)
+
+			if len(trackers) == 0 {
+				continue
+			}
+
 			for _, tracker := range trackers {
+				fmt.Printf("Tracker URL: %+v\n", tracker)
 
 				trackerUrl, err := url.Parse(tracker)
 				if err != nil {
@@ -319,9 +323,7 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 					continue
 				}
 
-				print(trackerUrl.String())
 				tracker := NewTracker(trackerUrl)
-				fmt.Printf("%+v\n", tracker)
 
 				childCtx, ctxCancel := context.WithTimeout(ctx, 30*time.Second)
 				defer ctxCancel()
@@ -365,9 +367,11 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 					mngr.Tracker.peerMap[p.id] = true
 				}
 
+				fmt.Printf("Tracker response received: %+v\n", trackerResponse)
 				return nil
 
 			case <-time.After(30 * time.Second):
+				fmt.Printf("Tracker response timed out\n")
 				continue
 			case <-ctx.Done():
 				return nil
