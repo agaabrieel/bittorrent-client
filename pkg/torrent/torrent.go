@@ -11,6 +11,7 @@ import (
 
 	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
 	"github.com/agaabrieel/bittorrent-client/pkg/io"
+	"github.com/agaabrieel/bittorrent-client/pkg/lifecycle"
 	logger "github.com/agaabrieel/bittorrent-client/pkg/log"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
@@ -18,6 +19,8 @@ import (
 	piece "github.com/agaabrieel/bittorrent-client/pkg/piece"
 	tracker "github.com/agaabrieel/bittorrent-client/pkg/tracker"
 )
+
+const CLIENT_PORT = 6881
 
 type SessionManager struct {
 	id       string
@@ -53,7 +56,7 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 		Router:   messaging.NewRouter(),
 		ClientId: clientId,
 		Metainfo: meta,
-		Port:     6881,
+		Port:     CLIENT_PORT,
 		RecvCh:   ch,
 		mu:       &sync.Mutex{},
 		wg:       &sync.WaitGroup{},
@@ -61,13 +64,9 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 
 }
 
-// TODO:
-// 1. IMPLEMENT PEER MANAGER MAIN LOOP
-
 func (mngr *SessionManager) Run() {
 
-	ctx, ctxCancel := context.WithCancel(context.Background())
-	defer ctxCancel()
+	LifecycleManager := lifecycle.NewLifecycle(context.Background())
 
 	ErrorHandler, errCh, err := apperrors.NewErrorHandler(ctxCancel)
 	if err != nil {

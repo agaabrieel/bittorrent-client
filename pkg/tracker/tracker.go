@@ -130,6 +130,18 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 		return
 	}
 
+	if mngr.Tracker == nil {
+		mngr.ErrCh <- apperrors.Error{
+			Err:         errors.New("tracker is nil"),
+			Message:     "tracker is nil",
+			Severity:    apperrors.Critical,
+			ErrorCode:   apperrors.ErrCodeInvalidTracker,
+			Time:        time.Now(),
+			ComponentId: "tracker_manager",
+		}
+		return
+	}
+
 	for _, peerAddr := range mngr.Tracker.peers {
 		mngr.Router.Send("peer_orchestrator", messaging.Message{
 			SourceId:    mngr.id,
@@ -302,14 +314,12 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 
 	} else {
 		for _, trackers := range mngr.Metainfo.AnnounceList {
-			fmt.Printf("Trackers URL: %+v\n", trackers)
 
 			if len(trackers) == 0 {
 				continue
 			}
 
 			for _, tracker := range trackers {
-				fmt.Printf("Tracker URL: %+v\n", tracker)
 
 				trackerUrl, err := url.Parse(tracker)
 				if err != nil {
@@ -359,6 +369,28 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 				mngr.wg.Wait()
 				close(trackerResponseCh)
 
+				if trackerResponse.tracker == nil {
+					mngr.ErrCh <- apperrors.Error{
+						Err:         errors.New("tracker response is nil"),
+						Message:     "tracker response is nil",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: "tracker_manager",
+					}
+					continue
+				}
+
+				if len(trackerResponse.peers) == 0 {
+					mngr.ErrCh <- apperrors.Error{
+						Err:         errors.New("tracker response has no peers"),
+						Message:     "tracker response has no peers",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: "tracker_manager",
+					}
+					continue
+				}
+
 				mngr.Tracker = trackerResponse.tracker
 				mngr.Tracker.interval = trackerResponse.interval
 				mngr.Tracker.peers = trackerResponse.peers
@@ -367,14 +399,45 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 					mngr.Tracker.peerMap[p.id] = true
 				}
 
-				fmt.Printf("Tracker response received: %+v\n", trackerResponse)
 				return nil
 
 			case <-time.After(30 * time.Second):
-				fmt.Printf("Tracker response timed out\n")
+				mngr.ErrCh <- apperrors.Error{
+					Err:         errors.New("tracker response timed out"),
+					Message:     "tracker response timed out",
+					Severity:    apperrors.Warning,
+					Time:        time.Now(),
+					ComponentId: "tracker_manager",
+				}
 				continue
 			case <-ctx.Done():
-				return nil
+
+				mngr.ErrCh <- apperrors.Error{
+					Err:         errors.New("tracker response timed out"),
+					Message:     "tracker response timed out",
+					Severity:    apperrors.Warning,
+					Time:        time.Now(),
+					ComponentId: "tracker_manager",
+				}
+
+				mngr.Tracker.interval = 0
+				mngr.Tracker.peers = nil
+				mngr.Tracker.peerMap = nil
+				mngr.Tracker = nil
+				mngr.wg.Wait()
+				close(trackerResponseCh)
+				mngr.AnnounceRespCh = nil
+				mngr.ErrCh = nil
+				mngr.RecvCh = nil
+				mngr.ClientId = [20]byte{}
+				mngr.Metainfo = nil
+				mngr.IsWaitingForAnnounceData = false
+				mngr.wg = nil
+				mngr.mu = nil
+				mngr.Router = nil
+				mngr.id = ""
+
+				return fmt.Errorf("tracker response timed out")
 			}
 		}
 	}

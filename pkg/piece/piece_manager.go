@@ -66,20 +66,32 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			case messaging.BlockRequest:
 				_, ok := msg.Payload.(messaging.BlockRequestPayload)
 				if !ok {
-					// LOG/RETURN/WHATEVER
+					mngr.ErrCh <- apperrors.Error{
+						Err:         fmt.Errorf("incorrect payload type"),
+						Message:     "incorrect payload type",
+						ErrorCode:   apperrors.ErrCodeInvalidPayload,
+						ComponentId: "piece_manager",
+						Time:        time.Now(),
+						Severity:    apperrors.Warning,
+					}
 					return
 				}
 				go mngr.processBlockRequest(childCtx, msg)
+
 			case messaging.BlockSend:
 				_, ok := msg.Payload.(messaging.BlockSendPayload)
 				if !ok {
-					// mngr.ErrCh <- errors.New("incorrect payload type")
-					// log, whatever
+					mngr.ErrCh <- apperrors.Error{
+						Err:         fmt.Errorf("incorrect payload type"),
+						Message:     "incorrect payload type",
+						ErrorCode:   apperrors.ErrCodeInvalidPayload,
+						ComponentId: "piece_manager",
+						Time:        time.Now(),
+						Severity:    apperrors.Warning,
+					}
 					return
 				}
 				go mngr.processBlockSend(childCtx, msg)
-			default:
-				// LOG, WHATEVER
 			}
 
 		case <-ctx.Done():
@@ -96,7 +108,7 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
 
 func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging.Message) {
 
-	resultChan := make(chan bool)
+	resultChan := make(chan bool, 1)
 
 	go func() {
 
@@ -145,6 +157,15 @@ func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging
 				CreatedAt: time.Now(),
 			})
 
+			mngr.ErrCh <- apperrors.Error{
+				Err:         fmt.Errorf("failed to get block with offset %d (piece %d): %w", data.Offset, data.Index, err),
+				Message:     fmt.Sprintf("failed to get block with offset %d (piece %d)", data.Offset, data.Index),
+				ErrorCode:   apperrors.ErrCodeInvalidBlock,
+				ComponentId: "processBlockRequestGoroutine",
+				Time:        time.Now(),
+				Severity:    apperrors.Warning,
+			}
+
 		}
 
 		resultChan <- true
@@ -152,6 +173,7 @@ func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging
 
 	select {
 	case <-resultChan:
+		close(resultChan)
 		return
 	case <-ctx.Done():
 		mngr.ErrCh <- apperrors.Error{
@@ -169,7 +191,7 @@ func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging
 
 func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Message) {
 
-	resultChan := make(chan bool)
+	resultChan := make(chan bool, 1)
 	go func() {
 
 		mngr.mu.Lock()
@@ -177,7 +199,14 @@ func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Me
 
 		data, ok := msg.Payload.(messaging.BlockSendPayload)
 		if !ok {
-			// log
+			mngr.ErrCh <- apperrors.Error{
+				Err:         fmt.Errorf("incorrect payload type"),
+				Message:     "incorrect payload type",
+				ErrorCode:   apperrors.ErrCodeInvalidPayload,
+				ComponentId: "processBlockSendGoroutine",
+				Time:        time.Now(),
+				Severity:    apperrors.Warning,
+			}
 			return
 		}
 
@@ -186,11 +215,54 @@ func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Me
 
 		mngr.PieceCache.PutBlock(data.Data, data.Index, data.Offset)
 
-		if isComplete, err := mngr.PieceCache.isPieceComplete(data.Index, uint32(mngr.Metainfo.PieceLength)); isComplete && err != nil && mngr.validatePiece(data.Index) {
+		isPieceComplete, err := mngr.PieceCache.isPieceComplete(data.Index, uint32(mngr.Metainfo.PieceLength))
+		if err != nil {
+			mngr.ErrCh <- apperrors.Error{
+				Err:         fmt.Errorf("failed to check if piece %d is complete: %w", data.Index, err),
+				Message:     fmt.Sprintf("failed to check if piece %d is complete", data.Index),
+				ErrorCode:   apperrors.ErrCodeInvalidPiece,
+				ComponentId: "processBlockSendGoroutine",
+				Time:        time.Now(),
+				Severity:    apperrors.Warning,
+			}
+			return
+		}
+
+		if !mngr.validatePiece(data.Index) {
+			mngr.ErrCh <- apperrors.Error{
+				Err:         fmt.Errorf("piece %d is invalid", data.Index),
+				Message:     fmt.Sprintf("piece %d is invalid", data.Index),
+				ErrorCode:   apperrors.ErrCodeInvalidPiece,
+				ComponentId: "processBlockSendGoroutine",
+				Time:        time.Now(),
+				Severity:    apperrors.Warning,
+			}
+
+			mngr.Router.Broadcast(messaging.Message{
+				SourceId:    mngr.id,
+				ReplyTo:     "",
+				PayloadType: messaging.PieceInvalidated,
+				Payload: messaging.PieceInvalidatedPayload{
+					Index: data.Index,
+				},
+				CreatedAt: time.Now(),
+			})
+			return
+		}
+
+		if isPieceComplete {
 
 			piece, err := mngr.PieceCache.GetPiece(data.Index)
 			if err != nil {
-
+				mngr.ErrCh <- apperrors.Error{
+					Err:         fmt.Errorf("failed to process block for piece %d: %w", data.Index, err),
+					Message:     fmt.Sprintf("failed to process block for piece %d", data.Index),
+					ErrorCode:   apperrors.ErrCodeInvalidPiece,
+					ComponentId: "processBlockSendGoroutine",
+					Time:        time.Now(),
+					Severity:    apperrors.Warning,
+				}
+				return
 			}
 
 			mngr.Bitfield.Set(uint(data.Index))
@@ -223,6 +295,7 @@ func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Me
 
 	select {
 	case <-resultChan:
+		close(resultChan)
 		return
 	case <-ctx.Done():
 		mngr.ErrCh <- apperrors.Error{

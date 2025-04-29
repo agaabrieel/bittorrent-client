@@ -43,7 +43,6 @@ func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, er
 		RecvCh:         ch,
 		ErrorCh:        errCh,
 		Mutex:          &sync.RWMutex{},
-		Waitgroup:      &sync.WaitGroup{},
 	}, nil
 }
 
@@ -58,7 +57,6 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 		case msg := <-mngr.RecvCh:
 			switch msg.PayloadType {
 			case messaging.PeersDiscovered:
-
 				payload, ok := msg.Payload.(messaging.PeersDiscoveredPayload)
 				if !ok {
 					mngr.ErrorCh <- apperrors.Error{
@@ -76,9 +74,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 				go func() {
 					defer wg.Done()
 					for _, addr := range payload.Addrs {
-						peerMngr := NewPeerManager(mngr.Router, nil, addr, mngr.ErrorCh)
-						wg.Add(1)
-						defer wg.Done()
+						peerMngr := NewPeerManager(mngr.Router, nil, addr, wg, mngr.ErrorCh)
 						go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
 					}
 				}()
@@ -99,7 +95,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr(), mngr.ErrorCh)
+					peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr(), wg, mngr.ErrorCh)
 					go peerMngr.replyToPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
 				}()
 

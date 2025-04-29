@@ -17,6 +17,7 @@ const (
 	PeersDiscovered
 	PeerConnected
 	PieceValidated
+	PieceInvalidated
 	Error
 )
 
@@ -76,6 +77,10 @@ type PeerConnectedPayload struct {
 }
 
 type PieceValidatedPayload struct {
+	Index uint32
+}
+
+type PieceInvalidatedPayload struct {
 	Index uint32
 }
 

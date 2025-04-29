@@ -51,15 +51,13 @@ func (pc *PieceCache) GetPiece(idx uint32) (*Piece, error) {
 	if filename, exists := pc.filenameMap[idx]; exists {
 		f, err := os.OpenFile(filename, os.O_RDONLY, 0644)
 		if err != nil {
-			// log
-			return nil, err
+			return nil, fmt.Errorf("failed to open file %s: %w", filename, err)
 		}
 		defer f.Close()
 
 		pieceSize, err := f.Seek(-BLOCK_BITFIELD_SIZE, 2)
 		if err != nil {
-			// log
-			return nil, err
+			return nil, fmt.Errorf("failed to seek to piece size: %w", err)
 		}
 
 		newPiece := &Piece{
@@ -79,7 +77,7 @@ func (pc *PieceCache) GetPiece(idx uint32) (*Piece, error) {
 	return nil, fmt.Errorf("piece %d does not exist", idx)
 }
 
-func (pc *PieceCache) putPiece(idx uint32, piece *Piece) {
+func (pc *PieceCache) putPiece(idx uint32, piece *Piece) error {
 
 	// Create new entry
 	newEntry := &PieceCacheEntry{
@@ -103,8 +101,7 @@ func (pc *PieceCache) putPiece(idx uint32, piece *Piece) {
 
 				f, err = os.OpenFile(filename, os.O_RDWR, 0644)
 				if err != nil {
-					// log
-					return
+					return fmt.Errorf("failed to open file %s: %w", filename, err)
 				}
 				defer f.Close()
 
@@ -112,8 +109,7 @@ func (pc *PieceCache) putPiece(idx uint32, piece *Piece) {
 
 				f, err = os.CreateTemp("tmp/", fmt.Sprintf("piece-%d-*", idx))
 				if err != nil {
-					// log
-					return
+					return fmt.Errorf("failed to create temp file: %w", err)
 				}
 				defer f.Close()
 
@@ -133,6 +129,7 @@ func (pc *PieceCache) putPiece(idx uint32, piece *Piece) {
 			delete(pc.cacheMap, lastEntry.Value.(*PieceCacheEntry).idx)
 		}
 	}
+	return nil
 }
 
 func (pc *PieceCache) GetBlock(idx, offset, size uint32) ([]byte, error) {
@@ -140,7 +137,7 @@ func (pc *PieceCache) GetBlock(idx, offset, size uint32) ([]byte, error) {
 	piece, err := pc.GetPiece(idx)
 	if err != nil {
 		// log
-		return nil, err
+		return nil, fmt.Errorf("failed to get block with offset %d (piece %d): %w", offset, idx, err)
 	}
 	return piece.Blocks[offset : offset+size], nil
 }
@@ -149,8 +146,7 @@ func (pc *PieceCache) PutBlock(data []byte, idx, offset uint32) error {
 
 	piece, err := pc.GetPiece(idx)
 	if err != nil {
-		// log
-		return err
+		return fmt.Errorf("failed to get piece %d: %w", idx, err)
 	}
 	copy(piece.Blocks[offset:], data)
 	piece.BlockBitfield.Set(uint(BLOCK_SIZE / offset))
@@ -174,7 +170,7 @@ func (pc *PieceCache) Cleanup() {
 func (pc *PieceCache) isPieceComplete(idx, pieceSize uint32) (bool, error) {
 	piece, err := pc.GetPiece(idx)
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("failed to get piece %d: %w", idx, err)
 	}
 	totalBlocks := pieceSize/BLOCK_SIZE + uint32(math.Ceil(float64((pieceSize)%(BLOCK_SIZE))/float64(8)))
 

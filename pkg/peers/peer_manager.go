@@ -60,7 +60,7 @@ type PeerManager struct {
 	ErrorCh         chan<- apperrors.Error
 }
 
-func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, errCh chan<- apperrors.Error) *PeerManager {
+func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.WaitGroup, errCh chan<- apperrors.Error) *PeerManager {
 
 	id, ch := uuid.New().String(), make(chan messaging.Message, 1024)
 
@@ -71,7 +71,7 @@ func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, errCh cha
 		PeerConn: conn,
 		PeerAddr: addr,
 		mu:       &sync.RWMutex{},
-		wg:       &sync.WaitGroup{},
+		wg:       wg,
 		RecvCh:   ch,
 		ErrorCh:  errCh,
 	}
@@ -79,6 +79,7 @@ func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, errCh cha
 
 func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte, clientId [20]byte) {
 
+	p.wg.Add(1)
 	defer p.wg.Done()
 
 	childCtx, ctxCancel := context.WithCancel(ctx)
@@ -221,6 +222,7 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 
 func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byte, clientId [20]byte) {
 
+	p.wg.Add(1)
 	defer p.wg.Done()
 
 	childCtx, ctxCancel := context.WithCancel(ctx)
@@ -336,6 +338,7 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 
 func (p *PeerManager) mainLoop(ctx context.Context) {
 
+	p.wg.Add(1)
 	defer p.wg.Done()
 	defer p.PeerConn.Close()
 
@@ -364,7 +367,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 		p.ErrorCh <- apperrors.Error{
 			Err:         err,
 			Message:     "failed to send bitfield message",
-			Severity:    apperrors.Warning,
+			Severity:    apperrors.Critical,
 			Time:        time.Now(),
 			ComponentId: p.id,
 		}
@@ -383,15 +386,19 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 				return
 
 			case msg := <-peerConnRecvCh:
+				p.wg.Add(1)
 				go func() {
-					p.LastMessage = msg
-					p.LastActive = time.Now()
 
 					p.mu.Lock()
 					defer p.mu.Unlock()
+					defer p.wg.Done()
+
+					p.LastMessage = msg
+					p.LastActive = time.Now()
+
 					switch msg.messageType {
 
-					// First 6 cases simply update the internal peer status
+					// First 4 cases simply update the internal peer state
 					case Choke:
 						p.IsChoking = true
 
@@ -484,8 +491,13 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 			case <-ctx.Done():
 				// LOG STUFF
 				return
+
 			case msg := <-p.RecvCh:
+				p.wg.Add(1)
 				go func() {
+
+					defer p.wg.Done()
+
 					switch msg.PayloadType {
 					case messaging.BlockSend:
 
@@ -529,10 +541,6 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						p.OurBitfield.Set(uint(payload.Index))
 						peerConnSendCh <- generateHaveMsg(payload.Index)
 						p.mu.Unlock()
-
-					default:
-						// LOG STUFF
-						return
 					}
 				}()
 			}
