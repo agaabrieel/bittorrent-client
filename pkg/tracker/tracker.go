@@ -32,7 +32,7 @@ const (
 )
 
 type client interface {
-	Announce(ctx context.Context, trackerUrl *url.URL, req AnnounceRequest) (AnnounceResponse, error)
+	Announce(ctx context.Context, trackerUrl *url.URL, req AnnounceRequest) (*AnnounceResponse, error)
 }
 
 type HTTPClient struct {
@@ -439,41 +439,46 @@ func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req Announce
 		return
 	}
 
-	if resp.interval > 0 {
-		t.interval = resp.interval
-	} else {
-		t.interval = time.Second * 600
+	if resp == nil {
+		errCh <- apperrors.Error{
+			Err:         fmt.Errorf("tracker response is nil"),
+			Message:     "tracker response is nil",
+			Severity:    apperrors.Warning,
+			Time:        time.Now(),
+			ComponentId: "tracker_manager",
+		}
+		return
 	}
 
 	resp.tracker = t
 
 	select {
-	case respCh <- resp:
+	case respCh <- *resp:
 	case <-ctx.Done():
 	default:
 		// If the channel is full, we don't care about the response anymore
 	}
 }
 
-func (c *UDPClient) Announce(ctx context.Context, trackerUrl *url.URL, req AnnounceRequest) (AnnounceResponse, error) {
+func (c *UDPClient) Announce(ctx context.Context, trackerUrl *url.URL, req AnnounceRequest) (*AnnounceResponse, error) {
 
 	childCtx, ctxCancel := context.WithCancel(ctx)
 	defer ctxCancel()
 
-	var announceResp AnnounceResponse
+	var announceResp *AnnounceResponse
 
 	if c.dialer == nil {
-		return AnnounceResponse{}, fmt.Errorf("client has no valid dialer")
+		return nil, fmt.Errorf("client has no valid dialer")
 	}
 
 	serverAddr, err := net.ResolveUDPAddr("udp", trackerUrl.Host)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to resolve UDP address: %w", err)
+		return nil, fmt.Errorf("failed to resolve UDP address: %w", err)
 	}
 
 	conn, err := c.dialer.DialContext(childCtx, "udp", serverAddr.String())
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to connect to tracker: %w", err)
+		return nil, fmt.Errorf("failed to connect to tracker: %w", err)
 	}
 	defer conn.Close()
 
@@ -501,7 +506,7 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl *url.URL, req Annou
 
 	connId, err := c.makeConnectionRequest(childCtx, conn)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to make connection request: %w", err)
+		return nil, fmt.Errorf("failed to make connection request: %w", err)
 	}
 
 	c.mutex.Lock()
@@ -510,19 +515,19 @@ func (c *UDPClient) Announce(ctx context.Context, trackerUrl *url.URL, req Annou
 
 	announceResp, err = c.makeAnnounceRequest(childCtx, connId, req, conn)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to make announce request: %w", err)
+		return nil, fmt.Errorf("failed to make announce request: %w", err)
 	}
 
 	return announceResp, nil
 }
 
-func (c *HTTPClient) Announce(ctx context.Context, trackerUrl *url.URL, req AnnounceRequest) (AnnounceResponse, error) {
+func (c *HTTPClient) Announce(ctx context.Context, trackerUrl *url.URL, req AnnounceRequest) (*AnnounceResponse, error) {
 
 	childCtx, ctxCancel := context.WithCancel(ctx)
 	defer ctxCancel()
 
 	if c.client == nil {
-		return AnnounceResponse{}, errors.New("tracker client is nil")
+		return nil, errors.New("tracker client is nil")
 	}
 
 	params := url.Values{}
@@ -549,46 +554,74 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerUrl *url.URL, req Anno
 
 	httpReq, err := http.NewRequestWithContext(childCtx, http.MethodGet, finalUrl.String(), nil)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to create request context: %w", err)
+		return nil, fmt.Errorf("failed to create request context: %w", err)
 	}
 
 	resp, err := c.client.Do(httpReq)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to make tracker requerst: %w", err)
+		return nil, fmt.Errorf("failed to make tracker requerst: %w", err)
 	}
 	defer resp.Body.Close()
 
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to read tracker response: %w", err)
+		return nil, fmt.Errorf("failed to read tracker response: %w", err)
 	}
 
 	parserCtx, err := parser.NewParserContext(b)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("parser context creation failed: %w", err)
+		return nil, fmt.Errorf("parser context creation failed: %w", err)
 	}
 
 	rootDict, err := parserCtx.Parse()
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("response parsing failed: %w", err)
+		return nil, fmt.Errorf("response parsing failed: %w", err)
+	}
+
+	if rootDict.ValueType != parser.BencodeDict {
+		return nil, fmt.Errorf("invalid response format: %w", err)
+	}
+
+	var warning string
+	for _, entry := range rootDict.DictValue {
+		key, err := entry.Key.GetStringValue()
+		if err != nil {
+			return nil, fmt.Errorf("error parsing response key: %w", err)
+		}
+
+		switch key {
+		case "failure reason":
+			val, err := entry.Value.GetStringValue()
+			if err != nil {
+				return nil, fmt.Errorf("error parsing failure reason: %w", err)
+			}
+			return nil, fmt.Errorf("tracker returned failure: %v", val)
+		case "warning message":
+			warning, err = entry.Value.GetStringValue()
+			if err != nil {
+				return nil, fmt.Errorf("error parsing warning message: %w", err)
+			}
+		default:
+			// Ignore other keys
+		}
 	}
 
 	announceResp, err := parseAnnounceResponse(rootDict)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("response parsing failed: %w", err)
+		return nil, fmt.Errorf("response parsing failed: %w", err)
 	}
 
-	return announceResp, nil
+	return announceResp, fmt.Errorf("warning from tracker: %s", warning)
 }
 
-func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req AnnounceRequest, conn net.Conn) (AnnounceResponse, error) {
+func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req AnnounceRequest, conn net.Conn) (*AnnounceResponse, error) {
 
 	childCtx, ctxCancel := context.WithCancel(ctx)
 	defer ctxCancel()
 
 	var announceTransactionIDBytes [4]byte
 	if _, err := io.ReadFull(rand.Reader, announceTransactionIDBytes[:]); err != nil {
-		return AnnounceResponse{}, fmt.Errorf("failed to generate announce transaction ID: %w", err)
+		return nil, fmt.Errorf("failed to generate announce transaction ID: %w", err)
 	}
 	announceTransactionId := binary.BigEndian.Uint32(announceTransactionIDBytes[:])
 
@@ -602,11 +635,11 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 
 	n, err := conn.Write(announceMsg)
 	if err != nil {
-		return AnnounceResponse{}, fmt.Errorf("invalid announce response: %w", err)
+		return nil, fmt.Errorf("invalid announce response: %w", err)
 	}
 
 	if n != 98 {
-		return AnnounceResponse{}, fmt.Errorf("wrote %d bytes, expected 98 bytes", n)
+		return nil, fmt.Errorf("wrote %d bytes, expected 98 bytes", n)
 	}
 
 	if deadline, ok := childCtx.Deadline(); ok {
@@ -621,15 +654,15 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 	n, err = conn.Read(announceBuffer)
 	if err != nil {
 		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			return AnnounceResponse{}, fmt.Errorf("UDP connect timed out waiting for response from %s: %w", conn.RemoteAddr().String(), err)
+			return nil, fmt.Errorf("UDP connect timed out waiting for response from %s: %w", conn.RemoteAddr().String(), err)
 		}
-		return AnnounceResponse{}, fmt.Errorf("failed to read UDP connect response: %w", err)
+		return nil, fmt.Errorf("failed to read UDP connect response: %w", err)
 	}
 
 	announceResponseBytes := announceBuffer[:n] // Use actual bytes read
 
 	if len(announceResponseBytes) < 8 { // Need at least action + transactionId for error check
-		return AnnounceResponse{}, fmt.Errorf("announce response too short: got %d bytes, expected at least 8", len(announceResponseBytes))
+		return nil, fmt.Errorf("announce response too short: got %d bytes, expected at least 8", len(announceResponseBytes))
 	}
 
 	action := binary.BigEndian.Uint32(announceBuffer[0:4])
@@ -640,23 +673,23 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 		if len(announceResponseBytes) > 8 { // Error message is optional
 			errorMsg = fmt.Sprintf("tracker returned error: %s", string(announceResponseBytes[8:]))
 		}
-		return AnnounceResponse{}, errors.New(errorMsg)
+		return nil, errors.New(errorMsg)
 	} else if action != uint32(AnnounceAction) {
-		return AnnounceResponse{}, fmt.Errorf("expected action announce, got %s", string(announceBuffer[0:4]))
+		return nil, fmt.Errorf("expected action announce, got %s", string(announceBuffer[0:4]))
 	}
 
 	if n < 20 {
-		return AnnounceResponse{}, fmt.Errorf("tracker responded with %d bytes, expected at least 20 bytes: %w", n, err)
+		return nil, fmt.Errorf("tracker responded with %d bytes, expected at least 20 bytes: %w", n, err)
 	}
 
 	if responseTransactionID != announceTransactionId {
-		return AnnounceResponse{}, fmt.Errorf("transaction id from response differs from sent id: expected %d, got %d", responseTransactionID, announceTransactionId)
+		return nil, fmt.Errorf("transaction id from response differs from sent id: expected %d, got %d", responseTransactionID, announceTransactionId)
 	}
 
 	peerData := announceBuffer[20:n]
 	numPeers := len(peerData) / 6
 	if len(peerData)%6 != 0 {
-		return AnnounceResponse{}, fmt.Errorf("incomplete peer data received (%d bytes)", len(peerData))
+		return nil, fmt.Errorf("incomplete peer data received (%d bytes)", len(peerData))
 	}
 
 	var announceResp AnnounceResponse
@@ -673,7 +706,7 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 		})
 	}
 
-	return announceResp, nil
+	return &announceResp, nil
 }
 
 func (c *UDPClient) makeConnectionRequest(ctx context.Context, conn net.Conn) (uint64, error) {
@@ -775,14 +808,14 @@ func (c *UDPClient) generateAnnounceMsg(transactionId uint32, req AnnounceReques
 	return announceMsg
 }
 
-func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) {
+func parseAnnounceResponse(root *parser.BencodeValue) (*AnnounceResponse, error) {
 
 	var resp AnnounceResponse
 
 	for _, entry := range root.DictValue {
 		key, err := entry.Key.GetStringValue()
 		if err != nil {
-			return AnnounceResponse{}, err
+			return nil, err
 		}
 
 		switch key {
@@ -791,10 +824,10 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 
 			val, err := entry.Value.GetStringValue()
 			if err != nil {
-				return AnnounceResponse{}, fmt.Errorf("error parsing failure reason: %w", err)
+				return nil, fmt.Errorf("error parsing failure reason: %w", err)
 			}
 
-			return AnnounceResponse{}, fmt.Errorf("tracker returned failure: %v", val)
+			return nil, fmt.Errorf("tracker returned failure: %v", val)
 
 		case "interval":
 
@@ -808,7 +841,7 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 				peersListSize := len(root.StringValue)
 
 				if peersListSize%peerSize != 0 {
-					return AnnounceResponse{}, fmt.Errorf("invalid compact response format: %w", err)
+					return nil, fmt.Errorf("invalid compact response format: %w", err)
 				}
 
 				for i := 0; i < len(entry.Value.StringValue); i += peerSize {
@@ -830,7 +863,7 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 
 						k, err := entry.Key.GetStringValue()
 						if err != nil {
-							return AnnounceResponse{}, err
+							return nil, err
 						}
 
 						switch k {
@@ -851,5 +884,5 @@ func parseAnnounceResponse(root *parser.BencodeValue) (AnnounceResponse, error) 
 			}
 		}
 	}
-	return resp, nil
+	return &resp, nil
 }
