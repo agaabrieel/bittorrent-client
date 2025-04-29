@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"os"
-	"sync"
 	"time"
 )
 
@@ -42,11 +41,11 @@ type Error struct {
 
 type ErrorHandler struct {
 	*log.Logger
-	RecvCh            <-chan Error
-	ContextCancelFunc context.CancelFunc
+	RecvCh             <-chan Error
+	LifecycleManagerCh chan<- bool
 }
 
-func NewErrorHandler(ctxCancelFunc context.CancelFunc) (*ErrorHandler, chan<- Error, error) {
+func NewErrorHandler(lifecycleCh chan<- bool) (*ErrorHandler, chan<- Error, error) {
 
 	f, err := os.Create("errors.log")
 	if err != nil {
@@ -58,21 +57,36 @@ func NewErrorHandler(ctxCancelFunc context.CancelFunc) (*ErrorHandler, chan<- Er
 	errCh := make(chan Error, 2056)
 
 	return &ErrorHandler{
-		RecvCh:            errCh,
-		ContextCancelFunc: ctxCancelFunc,
-		Logger:            logger,
+		RecvCh:             errCh,
+		LifecycleManagerCh: lifecycleCh,
+		Logger:             logger,
 	}, errCh, nil
 }
 
-func (h *ErrorHandler) Run(wg *sync.WaitGroup) {
+func (h *ErrorHandler) Run(ctx context.Context) {
 
-	defer wg.Done()
-
-	for msg := range h.RecvCh {
-		h.Logger.Printf("[%+v] %v: %v (id=%v)", msg.Severity, msg.Err.Error(), msg.Message, msg.ComponentId)
-		if msg.Severity == Critical {
-			h.ContextCancelFunc()
-			return
+	select {
+	case <-ctx.Done():
+		h.Logger.Printf("Error handler context is done, exiting")
+		return
+	case msg := <-h.RecvCh:
+		if msg.Err == nil {
+			h.Logger.Printf("[%+v] %v: %v (id=%v)", msg.Severity, msg.Err.Error(), msg.Message, msg.ComponentId)
+			if msg.Severity == Critical {
+				select {
+				case h.LifecycleManagerCh <- true:
+				case <-time.After(5 * time.Second):
+					h.Logger.Printf("Lifecycle manager channel is closed, exiting")
+					h.Logger.Printf("Error: %v", msg.Err)
+					h.Logger.Printf("Message: %v", msg.Message)
+					h.Logger.Printf("ComponentId: %v", msg.ComponentId)
+					h.Logger.Printf("Severity: %v", msg.Severity)
+					h.Logger.Printf("ErrorCode: %v", msg.ErrorCode)
+					h.Logger.Printf("Time: %v", msg.Time)
+					h.Logger.Printf("Exiting")
+				}
+				return
+			}
 		}
 	}
 }

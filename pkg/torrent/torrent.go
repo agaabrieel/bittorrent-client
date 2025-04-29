@@ -66,9 +66,10 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 
 func (mngr *SessionManager) Run() {
 
-	LifecycleManager := lifecycle.NewLifecycle(context.Background())
+	lc, fatalErrCh := lifecycle.NewLifecycle(context.Background())
+	spawner := lc.Spawner()
 
-	ErrorHandler, errCh, err := apperrors.NewErrorHandler(ctxCancel)
+	ErrorHandler, errCh, err := apperrors.NewErrorHandler(fatalErrCh)
 	if err != nil {
 		panic(err)
 	}
@@ -98,8 +99,11 @@ func (mngr *SessionManager) Run() {
 		Logger.Panicf("failed to create io manager: %v", err)
 	}
 
-	mngr.wg.Add(1)
-	go ErrorHandler.Run(mngr.wg)
+	lc.Go(ErrorHandler.Run)
+
+	lc.Go(func(ctx context.Context) {
+
+	})
 
 	mngr.wg.Add(1)
 	go Logger.Run(ctx, mngr.wg)
@@ -148,5 +152,6 @@ func (mngr *SessionManager) Run() {
 			})
 		}
 	}()
-	<-ctx.Done()
+	<-lc.Context().Done()
+	lc.Shutdown()
 }

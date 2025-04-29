@@ -10,16 +10,25 @@ import (
 type TaskSpawner func(func(ctx context.Context))
 
 type Lifecycle struct {
-	wg     sync.WaitGroup
-	ctx    context.Context
-	cancel context.CancelFunc
+	wg         sync.WaitGroup
+	ctx        context.Context
+	cancel     context.CancelFunc
+	fatalErrCh <-chan bool
 }
 
-func NewLifecycle(parent context.Context) *Lifecycle {
+func NewLifecycle(parent context.Context) (*Lifecycle, chan<- bool) {
 	ctx, cancel := context.WithCancel(parent)
+	ch := make(chan bool, 1)
 	return &Lifecycle{
-		ctx:    ctx,
-		cancel: cancel,
+		ctx:        ctx,
+		cancel:     cancel,
+		fatalErrCh: ch,
+	}, ch
+}
+
+func (l *Lifecycle) Spawner() TaskSpawner {
+	return func(fn func(ctx context.Context)) {
+		l.Go(fn)
 	}
 }
 
