@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
+	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/bits-and-blooms/bitset"
 	"github.com/google/uuid"
@@ -54,10 +54,12 @@ type PeerManager struct {
 	PiecesRequested []PeerMessage
 	LastActive      time.Time
 	LastMessage     PeerMessage
+	SentMessages    map[string]bool
 	wg              *sync.WaitGroup
 	mu              *sync.RWMutex
 	RecvCh          <-chan messaging.Message
 	ErrorCh         chan<- apperrors.Error
+	BlocksToRequest chan messaging.BlockRequestPayload
 }
 
 func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.WaitGroup, errCh chan<- apperrors.Error) *PeerManager {
@@ -67,13 +69,14 @@ func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.
 	r.RegisterComponent(id, ch)
 
 	return &PeerManager{
-		id:       id,
-		PeerConn: conn,
-		PeerAddr: addr,
-		mu:       &sync.RWMutex{},
-		wg:       wg,
-		RecvCh:   ch,
-		ErrorCh:  errCh,
+		id:              id,
+		PeerConn:        conn,
+		PeerAddr:        addr,
+		mu:              &sync.RWMutex{},
+		wg:              wg,
+		RecvCh:          ch,
+		ErrorCh:         errCh,
+		BlocksToRequest: make(chan messaging.BlockRequestPayload, 1024),
 	}
 }
 
@@ -352,21 +355,21 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		go p.writeLoop(childCtx, peerConnSendCh)
+		p.writeLoop(childCtx, peerConnSendCh)
 	}()
 
 	// Reader loop
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		go p.readLoop(childCtx, peerConnRecvCh)
+		p.readLoop(childCtx, peerConnRecvCh)
 	}()
 
 	bitfieldMsg, err := generateBitfieldMsg(*p.OurBitfield)
 	if err != nil {
 		p.ErrorCh <- apperrors.Error{
 			Err:         err,
-			Message:     "failed to send bitfield message",
+			Message:     "failed to generate bitfield message",
 			Severity:    apperrors.Critical,
 			Time:        time.Now(),
 			ComponentId: p.id,
@@ -375,14 +378,14 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 	}
 
 	peerConnSendCh <- bitfieldMsg
+
+	// PEER MESSAGE LISTENER
 	p.wg.Add(1)
 	go func() {
-		// PEER MESSAGE LISTENER
 		defer p.wg.Done()
 		for {
 			select {
-			case <-ctx.Done():
-				// log stuff
+			case <-childCtx.Done():
 				return
 
 			case msg := <-peerConnRecvCh:
@@ -431,9 +434,24 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 							p.IsInteresting = false
 						}
 
+						msgId := uuid.NewString()
+						p.SentMessages[msgId] = true
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							MsgId:       msgId,
+							SourceId:    p.id,
+							ReplyTo:     p.id,
+							ReplyingTo:  "",
+							PayloadType: messaging.PeerBitfield,
+							Payload: messaging.PeerBitfieldPayload{
+								Bitfield: p.PeerBitfield,
+							},
+							CreatedAt: time.Now(),
+						})
+
 					case Have:
 
-						p.PeerBitfield.Set(uint(binary.BigEndian.Uint32(msg.data[5:])))
+						pieceIndex := binary.BigEndian.Uint32(msg.data[5:])
+						p.PeerBitfield.Set(uint(pieceIndex))
 
 						wantedPieces := p.PeerBitfield.Difference(p.OurBitfield)
 
@@ -447,11 +465,30 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 							p.IsInteresting = false
 						}
 
-					case Request:
-
-						p.Router.Send("piece_manager", messaging.Message{
+						msgId := uuid.NewString()
+						p.SentMessages[msgId] = true
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							MsgId:       msgId,
 							SourceId:    p.id,
 							ReplyTo:     p.id,
+							ReplyingTo:  "",
+							PayloadType: messaging.PeerBitfieldUpdate,
+							Payload: messaging.PeerBitfieldUpdatePayload{
+								Index: int(pieceIndex),
+							},
+							CreatedAt: time.Now(),
+						})
+
+					case Request:
+
+						msgId := uuid.NewString()
+						p.SentMessages[msgId] = true
+
+						p.Router.Send("piece_manager", messaging.Message{
+							MsgId:       msgId,
+							SourceId:    p.id,
+							ReplyTo:     p.id,
+							ReplyingTo:  "",
 							PayloadType: messaging.BlockRequest,
 							Payload: messaging.BlockRequestPayload{
 								Index:  binary.BigEndian.Uint32(msg.data[5:9]),
@@ -463,9 +500,14 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 					case Piece:
 
+						msgId := uuid.NewString()
+						p.SentMessages[msgId] = true
+
 						p.Router.Send("piece_manager", messaging.Message{
+							MsgId:       msgId,
 							SourceId:    p.id,
 							ReplyTo:     p.id,
+							ReplyingTo:  "",
 							PayloadType: messaging.BlockSend,
 							Payload: messaging.BlockSendPayload{
 								Index:  binary.BigEndian.Uint32(msg.data[5:9]),
@@ -475,96 +517,162 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 							},
 							CreatedAt: time.Now(),
 						})
-
 					}
 				}()
 			}
 		}
 	}()
 
+	// ROUTER LISTENING LOOP
 	p.wg.Add(1)
 	go func() {
-		// ROUTER LISTENING LOOP
 		defer p.wg.Done()
 		for {
 			select {
-			case <-ctx.Done():
+			case <-childCtx.Done():
 				// LOG STUFF
 				return
 
 			case msg := <-p.RecvCh:
-				p.wg.Add(1)
-				go func() {
 
-					defer p.wg.Done()
-
-					switch msg.PayloadType {
-					case messaging.BlockSend:
-
-						payload, ok := msg.Payload.(messaging.BlockSendPayload)
-						if !ok {
-							p.ErrorCh <- apperrors.Error{
-								Err:         errors.New("incorrect payload"),
-								Message:     fmt.Sprintf("expected BlockSendPayload, got %v", payload),
-								Severity:    apperrors.Warning,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							}
-							return
+				if msg.ReplyingTo != "" {
+					p.mu.Lock()
+					exists := p.SentMessages[msg.ReplyingTo]
+					if !exists {
+						p.ErrorCh <- apperrors.Error{
+							Err:         errors.New("unexpected message"),
+							Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+							Severity:    apperrors.Warning,
+							Time:        time.Now(),
+							ComponentId: p.id,
 						}
-
-						if p.IsInterested && !p.IsChoking {
-							peerConnSendCh <- generatePieceMsg(payload.Index, payload.Offset, payload.Data)
-						} else {
-							p.ErrorCh <- apperrors.Error{
-								Err:         errors.New("peer is not interested or is choking"),
-								Message:     fmt.Sprintf("dropping message %v", payload),
-								Severity:    apperrors.Warning,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							}
-						}
-					case messaging.PieceValidated:
-
-						payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
-						if !ok {
-
-							p.ErrorCh <- apperrors.Error{
-								Err:         errors.New("incorrect payload"),
-								Message:     fmt.Sprintf("expected PieceValidatedPayload, got %v", payload),
-								Severity:    apperrors.Warning,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							}
-						}
-						p.mu.Lock()
-						p.OurBitfield.Set(uint(payload.Index))
-						peerConnSendCh <- generateHaveMsg(payload.Index)
-						p.mu.Unlock()
+						continue
 					}
-				}()
-			}
-		}
+					delete(p.SentMessages, msg.ReplyingTo)
+					p.mu.Unlock()
+				}
 
-	}()
+				if msg.ReplyTo != "" {
+					p.Router.Send(msg.ReplyTo, messaging.Message{
+						MsgId:       uuid.NewString(),
+						SourceId:    p.id,
+						ReplyTo:     "",
+						ReplyingTo:  "",
+						PayloadType: messaging.Acknowledged,
+						Payload:     nil,
+						CreatedAt:   time.Now(),
+					})
+				}
 
-	p.wg.Add(1)
-	go func() {
-		// PIECE REQUEST LOOP
-		defer p.wg.Done()
-		for {
-			select {
-			case <-ctx.Done():
-				// stuff
-				return
-			default:
-				if p.IsInteresting && !p.IsChoking {
-					peerConnSendCh <- generateRequestMsg(uint32(10), uint32(10), uint32(10))
+				defer p.wg.Done()
+
+				switch msg.PayloadType {
+				case messaging.BlockSend:
+
+					payload, ok := msg.Payload.(messaging.BlockSendPayload)
+					if !ok {
+						p.ErrorCh <- apperrors.Error{
+							Err:         errors.New("incorrect payload"),
+							Message:     fmt.Sprintf("expected BlockSendPayload, got %v", payload),
+							Severity:    apperrors.Warning,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						}
+						return
+					}
+
+					if p.IsInterested && !p.IsChoking {
+						peerConnSendCh <- generatePieceMsg(payload.Index, payload.Offset, payload.Data)
+					} else {
+						p.ErrorCh <- apperrors.Error{
+							Err:         errors.New("peer is not interested or is choking"),
+							Message:     fmt.Sprintf("dropping message %v", payload),
+							Severity:    apperrors.Warning,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						}
+					}
+
+				case messaging.PieceValidated:
+
+					payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
+					if !ok {
+						p.ErrorCh <- apperrors.Error{
+							Err:         errors.New("incorrect payload"),
+							Message:     fmt.Sprintf("expected PieceValidatedPayload, got %v", payload),
+							Severity:    apperrors.Warning,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						}
+					}
+
+					p.mu.Lock()
+					p.OurBitfield.Set(uint(payload.Index))
+					peerConnSendCh <- generateHaveMsg(payload.Index)
+					p.mu.Unlock()
+
+				case messaging.NextBlockIndexSend:
+
+					payload, ok := msg.Payload.(messaging.NextBlockIndexSendPayload)
+					if !ok {
+						p.ErrorCh <- apperrors.Error{
+							Err:         errors.New("incorrect payload"),
+							Message:     fmt.Sprintf("expected NextBlockIndexSendPayload, got %v", payload),
+							Severity:    apperrors.Warning,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						}
+					}
+
+					p.BlocksToRequest <- messaging.BlockRequestPayload{
+						Index:  uint32(payload.PieceIndex),
+						Offset: uint32(payload.Offset),
+						Size:   uint32(payload.Size),
+					}
+
 				}
 			}
 		}
 	}()
 
+	// PIECE REQUEST LOOP
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		for {
+			select {
+			case <-childCtx.Done():
+				// stuff
+				return
+			case block := <-p.BlocksToRequest:
+				if p.IsInteresting && !p.IsChoking {
+					peerConnSendCh <- generateRequestMsg(block.Index, block.Offset, block.Size)
+				}
+			}
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		ctxCancel()
+		return
+	default:
+
+		msgId := uuid.NewString()
+		p.SentMessages[msgId] = true
+
+		p.Router.Send("", messaging.Message{
+			MsgId:       msgId,
+			SourceId:    p.id,
+			ReplyTo:     p.id,
+			ReplyingTo:  "",
+			PayloadType: messaging.NextBlockIndexRequest,
+			Payload: messaging.NextBlockIndexRequestPayload{
+				PieceIndex: 1,
+			},
+			CreatedAt: time.Now(),
+		})
+	}
 }
 
 func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {

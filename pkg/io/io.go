@@ -2,27 +2,30 @@ package io
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sync"
 	"time"
 
-	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
+	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
+	"github.com/google/uuid"
 )
 
 type IOManager struct {
-	id        string
-	file      *os.File
-	Router    *messaging.Router
-	FileSize  int64
-	PieceSize int64
-	RecvCh    <-chan messaging.Message
-	ErrCh     chan<- apperrors.Error
-	mu        *sync.RWMutex
-	wg        *sync.WaitGroup
+	id           string
+	file         *os.File
+	Router       *messaging.Router
+	FileSize     int64
+	PieceSize    int64
+	SentMessages map[string]bool
+	RecvCh       <-chan messaging.Message
+	ErrCh        chan<- apperrors.Error
+	mu           sync.RWMutex
+	wg           sync.WaitGroup
 }
 
 func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error) (*IOManager, error) {
@@ -44,15 +47,16 @@ func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh cha
 	}
 
 	return &IOManager{
-		id:        id,
-		file:      f,
-		Router:    r,
-		PieceSize: int64(meta.InfoDict.PieceLength),
-		FileSize:  int64(meta.InfoDict.Length),
-		RecvCh:    ch,
-		ErrCh:     errCh,
-		mu:        &sync.RWMutex{},
-		wg:        &sync.WaitGroup{},
+		id:           id,
+		file:         f,
+		Router:       r,
+		PieceSize:    int64(meta.InfoDict.PieceLength),
+		FileSize:     int64(meta.InfoDict.Length),
+		RecvCh:       ch,
+		ErrCh:        errCh,
+		SentMessages: make(map[string]bool),
+		mu:           sync.RWMutex{},
+		wg:           sync.WaitGroup{},
 	}, nil
 }
 
@@ -61,10 +65,29 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	_, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
+
+			if msg.ReplyingTo != "" {
+				mngr.mu.Lock()
+				exists := mngr.SentMessages[msg.ReplyingTo]
+				if !exists {
+					mngr.ErrCh <- apperrors.Error{
+						Err:         errors.New("unexpected message"),
+						Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
+					continue
+				}
+				delete(mngr.SentMessages, msg.ReplyingTo)
+				mngr.mu.Unlock()
+			}
+
 			switch msg.PayloadType {
 			case messaging.PieceSend:
 
@@ -123,6 +146,19 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 						}
 						writtenBytes += int64(n)
 					}
+
+					if msg.ReplyTo != "" {
+						mngr.Router.Send(msg.ReplyTo, messaging.Message{
+							MsgId:       uuid.NewString(),
+							SourceId:    mngr.id,
+							ReplyTo:     "",
+							ReplyingTo:  msg.MsgId,
+							PayloadType: messaging.Acknowledged,
+							Payload:     nil,
+							CreatedAt:   time.Now(),
+						})
+					}
+
 				}()
 
 			case messaging.BlockRequest:
@@ -183,8 +219,10 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					}
 
 					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						MsgId:       uuid.NewString(),
 						SourceId:    mngr.id,
 						ReplyTo:     mngr.id,
+						ReplyingTo:  msg.MsgId,
 						PayloadType: messaging.BlockSend,
 						Payload: messaging.BlockSendPayload{
 							Index:  payload.Index,
@@ -198,7 +236,6 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 				}()
 			}
 		case <-ctx.Done():
-			cancel()
 			return
 		}
 	}

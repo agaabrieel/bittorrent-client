@@ -41,11 +41,11 @@ type Error struct {
 
 type ErrorHandler struct {
 	*log.Logger
-	RecvCh             <-chan Error
-	LifecycleManagerCh chan<- bool
+	RecvCh     <-chan Error
+	FatalErrCh chan<- any
 }
 
-func NewErrorHandler(lifecycleCh chan<- bool) (*ErrorHandler, chan<- Error, error) {
+func NewErrorHandler(fatalErrCh chan<- any) (*ErrorHandler, chan<- Error, error) {
 
 	f, err := os.Create("errors.log")
 	if err != nil {
@@ -53,13 +53,12 @@ func NewErrorHandler(lifecycleCh chan<- bool) (*ErrorHandler, chan<- Error, erro
 	}
 
 	logger := log.New(f, "", 10111)
-
 	errCh := make(chan Error, 2056)
 
 	return &ErrorHandler{
-		RecvCh:             errCh,
-		LifecycleManagerCh: lifecycleCh,
-		Logger:             logger,
+		RecvCh:     errCh,
+		FatalErrCh: fatalErrCh,
+		Logger:     logger,
 	}, errCh, nil
 }
 
@@ -74,7 +73,7 @@ func (h *ErrorHandler) Run(ctx context.Context) {
 			h.Logger.Printf("[%+v] %v: %v (id=%v)", msg.Severity, msg.Err.Error(), msg.Message, msg.ComponentId)
 			if msg.Severity == Critical {
 				select {
-				case h.LifecycleManagerCh <- true:
+				case h.FatalErrCh <- true:
 				case <-time.After(5 * time.Second):
 					h.Logger.Printf("Lifecycle manager channel is closed, exiting")
 					h.Logger.Printf("Error: %v", msg.Err)

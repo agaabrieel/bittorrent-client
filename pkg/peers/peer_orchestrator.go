@@ -7,10 +7,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
+	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	"github.com/bits-and-blooms/bitset"
+	"github.com/google/uuid"
 )
 
 type PeerOrchestrator struct {
@@ -19,6 +20,8 @@ type PeerOrchestrator struct {
 	clientId       [20]byte
 	clientInfohash [20]byte
 	Bitfield       *bitset.BitSet
+	PeerBitfields  map[string]*bitset.BitSet
+	SentMessages   map[string]bool
 	Mutex          *sync.RWMutex
 	Waitgroup      *sync.WaitGroup
 	RecvCh         <-chan messaging.Message
@@ -40,6 +43,7 @@ func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, er
 		clientId:       clientId,
 		clientInfohash: meta.Infohash,
 		Bitfield:       bitset.New(bsSize),
+		PeerBitfields:  make(map[string]*bitset.BitSet),
 		RecvCh:         ch,
 		ErrorCh:        errCh,
 		Mutex:          &sync.RWMutex{},
@@ -55,8 +59,39 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
+
+			if msg.ReplyingTo != "" {
+				mngr.Mutex.Lock()
+				exists := mngr.SentMessages[msg.ReplyingTo]
+				if !exists {
+					mngr.ErrorCh <- apperrors.Error{
+						Err:         errors.New("unexpected message"),
+						Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
+					continue
+				}
+				delete(mngr.SentMessages, msg.ReplyingTo)
+				mngr.Mutex.Unlock()
+			}
+
+			if msg.ReplyTo != "" {
+				mngr.Router.Send(msg.ReplyTo, messaging.Message{
+					MsgId:       uuid.NewString(),
+					SourceId:    mngr.id,
+					ReplyTo:     "",
+					ReplyingTo:  "",
+					PayloadType: messaging.Acknowledged,
+					Payload:     nil,
+					CreatedAt:   time.Now(),
+				})
+			}
+
 			switch msg.PayloadType {
 			case messaging.PeersDiscovered:
+
 				payload, ok := msg.Payload.(messaging.PeersDiscoveredPayload)
 				if !ok {
 					mngr.ErrorCh <- apperrors.Error{
@@ -67,19 +102,15 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 						Time:        time.Now(),
 						ComponentId: mngr.id,
 					}
-					continue
 				}
 
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					for _, addr := range payload.Addrs {
-						peerMngr := NewPeerManager(mngr.Router, nil, addr, wg, mngr.ErrorCh)
-						go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
-					}
-				}()
+				for _, addr := range payload.Addrs {
+					peerMngr := NewPeerManager(mngr.Router, nil, addr, wg, mngr.ErrorCh)
+					go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
+				}
 
 			case messaging.PeerConnected:
+
 				payload, ok := msg.Payload.(messaging.PeerConnectedPayload)
 				if !ok {
 					mngr.ErrorCh <- apperrors.Error{
@@ -89,17 +120,13 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 						Time:        time.Now(),
 						ComponentId: mngr.id,
 					}
-					continue
 				}
 
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr(), wg, mngr.ErrorCh)
-					go peerMngr.replyToPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
-				}()
+				peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr(), wg, mngr.ErrorCh)
+				go peerMngr.replyToPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
 
 			case messaging.PieceValidated:
+
 				payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
 				if !ok {
 					mngr.ErrorCh <- apperrors.Error{
@@ -109,7 +136,6 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 						Time:        time.Now(),
 						ComponentId: mngr.id,
 					}
-					continue
 				}
 
 				wg.Add(1)
@@ -119,6 +145,72 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 					defer wg.Done()
 					mngr.Bitfield.Set(uint(payload.Index))
 				}()
+
+			case messaging.PeerBitfield:
+
+				payload, ok := msg.Payload.(messaging.PeerBitfieldPayload)
+				if !ok {
+					mngr.ErrorCh <- apperrors.Error{
+						Err:         errors.New("incorrect payload"),
+						Message:     "incorrect payload",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
+				}
+
+				mngr.Mutex.Lock()
+				mngr.PeerBitfields[msg.SourceId] = payload.Bitfield
+				mngr.Mutex.Unlock()
+
+			case messaging.PeerBitfieldUpdate:
+
+				payload, ok := msg.Payload.(messaging.PeerBitfieldUpdatePayload)
+				if !ok {
+					mngr.ErrorCh <- apperrors.Error{
+						Err:         errors.New("incorrect payload"),
+						Message:     "incorrect payload",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
+				}
+
+				mngr.Mutex.Lock()
+				mngr.PeerBitfields[msg.SourceId].Set(uint(payload.Index))
+				mngr.Mutex.Unlock()
+
+			case messaging.NextPieceIndexRequest:
+
+				_, ok := msg.Payload.(messaging.NextPieceIndexRequestPayload)
+				if !ok {
+					mngr.ErrorCh <- apperrors.Error{
+						Err:         errors.New("incorrect payload"),
+						Message:     "incorrect payload",
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
+				}
+
+				// PICK NEXT PIECE BASED ON RARITY
+				// mockup
+				index := 10
+
+				msgId := uuid.NewString()
+				mngr.SentMessages[msgId] = true
+
+				mngr.Router.Send(msg.ReplyTo, messaging.Message{
+					MsgId:       msgId,
+					SourceId:    mngr.id,
+					ReplyTo:     mngr.id,
+					ReplyingTo:  msg.MsgId,
+					PayloadType: messaging.NextPieceIndexSend,
+					Payload: messaging.NextPieceIndexSendPayload{
+						Index: index,
+					},
+					CreatedAt: time.Now(),
+				})
 
 			}
 

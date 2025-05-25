@@ -3,6 +3,8 @@ package messaging
 import (
 	"net"
 	"time"
+
+	"github.com/bits-and-blooms/bitset"
 )
 
 type MessageType uint8
@@ -12,18 +14,27 @@ const (
 	BlockSend
 	PieceRequest
 	PieceSend
+	NextPieceIndexRequest
+	NextPieceIndexSend
+	NextBlockIndexRequest
+	NextBlockIndexSend
 	AnnounceDataRequest
 	AnnounceDataSend
 	PeersDiscovered
 	PeerConnected
+	PeerBitfield
+	PeerBitfieldUpdate
 	PieceValidated
 	PieceInvalidated
+	Acknowledged
 	Error
 )
 
 type Message struct {
+	MsgId       string
 	SourceId    string
 	ReplyTo     string
+	ReplyingTo  string
 	PayloadType MessageType
 	Payload     any
 	CreatedAt   time.Time
@@ -86,4 +97,29 @@ type PieceInvalidatedPayload struct {
 
 type ErrorPayload struct {
 	Msg string
+}
+
+type PeerBitfieldPayload struct {
+	Bitfield *bitset.BitSet
+}
+
+type PeerBitfieldUpdatePayload struct {
+	Index int
+}
+
+type NextPieceIndexRequestPayload struct {
+}
+
+type NextPieceIndexSendPayload struct {
+	Index int
+}
+
+type NextBlockIndexRequestPayload struct {
+	PieceIndex int
+}
+
+type NextBlockIndexSendPayload struct {
+	PieceIndex int
+	Offset     int
+	Size       int
 }

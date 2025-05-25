@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
+	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"

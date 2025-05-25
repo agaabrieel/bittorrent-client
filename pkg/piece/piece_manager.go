@@ -3,27 +3,30 @@ package piece
 import (
 	"context"
 	"crypto/sha1"
+	"errors"
 	"fmt"
 	"math"
 	"sync"
 	"time"
 
-	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
+	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	bitset "github.com/bits-and-blooms/bitset"
+	"github.com/google/uuid"
 )
 
 type PieceManager struct {
-	id         string
-	ClientId   [20]byte
-	Router     *messaging.Router
-	PieceCache *PieceCache
-	Metainfo   *metainfo.TorrentMetainfoInfoDict
-	Bitfield   *bitset.BitSet
-	RecvCh     <-chan messaging.Message
-	ErrCh      chan<- apperrors.Error
-	mu         *sync.RWMutex
+	id           string
+	ClientId     [20]byte
+	Router       *messaging.Router
+	PieceCache   *PieceCache
+	Metainfo     *metainfo.TorrentMetainfoInfoDict
+	Bitfield     *bitset.BitSet
+	SentMessages map[string]bool
+	RecvCh       <-chan messaging.Message
+	ErrCh        chan<- apperrors.Error
+	mu           *sync.RWMutex
 }
 
 func NewPieceManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error, clientId [20]byte) (*PieceManager, error) {
@@ -61,6 +64,36 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
+
+			if msg.ReplyingTo != "" {
+				mngr.mu.Lock()
+				exists := mngr.SentMessages[msg.ReplyingTo]
+				if !exists {
+					mngr.ErrCh <- apperrors.Error{
+						Err:         errors.New("unexpected message"),
+						Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+						Severity:    apperrors.Warning,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					}
+					continue
+				}
+				delete(mngr.SentMessages, msg.ReplyingTo)
+				mngr.mu.Unlock()
+			}
+
+			if msg.ReplyTo != "" {
+				mngr.Router.Send(msg.ReplyTo, messaging.Message{
+					MsgId:       uuid.NewString(),
+					SourceId:    mngr.id,
+					ReplyTo:     "",
+					ReplyingTo:  "",
+					PayloadType: messaging.Acknowledged,
+					Payload:     nil,
+					CreatedAt:   time.Now(),
+				})
+			}
+
 			switch msg.PayloadType {
 
 			case messaging.BlockRequest:
@@ -92,6 +125,21 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					return
 				}
 				go mngr.processBlockSend(childCtx, msg)
+
+			case messaging.NextPieceIndexRequest:
+				_, ok := msg.Payload.(messaging.NextBlockIndexRequestPayload)
+				if !ok {
+					mngr.ErrCh <- apperrors.Error{
+						Err:         fmt.Errorf("incorrect payload type"),
+						Message:     "incorrect payload type",
+						ErrorCode:   apperrors.ErrCodeInvalidPayload,
+						ComponentId: "piece_manager",
+						Time:        time.Now(),
+						Severity:    apperrors.Warning,
+					}
+					return
+				}
+				go mngr.processNextBlockRequest(childCtx, msg)
 			}
 
 		case <-ctx.Done():
@@ -100,10 +148,88 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-func (mngr *PieceManager) pickNextPiece() {
+func (mngr *PieceManager) processNextBlockRequest(ctx context.Context, msg messaging.Message) {
+
+	resultCh := make(chan bool, 1)
+
+	go func() {
+		payload := msg.Payload.(messaging.NextBlockIndexRequestPayload)
+
+		offset, size, err := mngr.pickNextBlock(uint32(payload.PieceIndex))
+		if err != nil {
+			mngr.ErrCh <- apperrors.Error{
+				Err:         err,
+				Message:     "failed to pick next block",
+				ErrorCode:   apperrors.ErrCodeInvalidBlock,
+				ComponentId: "piece_manager",
+				Time:        time.Now(),
+				Severity:    apperrors.Warning,
+			}
+			return
+		}
+
+		msgId := uuid.NewString()
+
+		mngr.mu.Lock()
+		mngr.SentMessages[msgId] = true
+		mngr.mu.Unlock()
+
+		mngr.Router.Send(msg.ReplyTo, messaging.Message{
+			MsgId:       msgId,
+			SourceId:    mngr.id,
+			ReplyTo:     mngr.id,
+			ReplyingTo:  msg.MsgId,
+			PayloadType: messaging.NextBlockIndexSend,
+			Payload: messaging.NextBlockIndexSendPayload{
+				PieceIndex: payload.PieceIndex,
+				Offset:     offset,
+				Size:       size,
+			},
+		})
+		resultCh <- true
+	}()
+
+	select {
+	case <-resultCh:
+		close(resultCh)
+		return
+	case <-ctx.Done():
+		mngr.ErrCh <- apperrors.Error{
+			Err:         fmt.Errorf("context cancelled"),
+			Message:     "context cancelled",
+			ErrorCode:   apperrors.ErrCodeContextCancelled,
+			ComponentId: "processNextBlockRequestGoroutine",
+			Time:        time.Now(),
+			Severity:    apperrors.Info,
+		}
+		return
+	}
 }
 
-func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) {
+func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) (int, int, error) {
+
+	mngr.mu.Lock()
+	defer mngr.mu.Unlock()
+
+	piece, err := mngr.PieceCache.GetPiece(pieceIndex)
+	if err != nil {
+		// log, do something, return
+		return -1, -1, err
+	}
+
+	mngr.PieceCache.mu.Lock()
+	defer mngr.PieceCache.mu.Unlock()
+
+	var blockIndex int
+	for i, status := range piece.BlockStatuses {
+		if status == Missing {
+			blockIndex = i
+			piece.BlockStatuses[i] = Pending
+			break
+		}
+	}
+
+	return blockIndex * BLOCK_SIZE, int(mngr.Metainfo.Length) - blockIndex*BLOCK_SIZE, nil
 }
 
 func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging.Message) {
@@ -127,12 +253,17 @@ func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging
 		mngr.PieceCache.mu.Lock()
 		defer mngr.PieceCache.mu.Unlock()
 
+		msgId := uuid.NewString()
+		mngr.SentMessages[msgId] = true
+
 		blockData, err = mngr.PieceCache.GetBlock(data.Index, data.Offset, data.Size)
 		if err != nil {
 
 			mngr.Router.Send(msg.ReplyTo, messaging.Message{
+				MsgId:       msgId,
 				SourceId:    mngr.id,
 				ReplyTo:     mngr.id,
+				ReplyingTo:  msg.MsgId,
 				PayloadType: messaging.BlockSend,
 				Payload: messaging.BlockSendPayload{
 					Index:  data.Index,
@@ -146,6 +277,7 @@ func (mngr *PieceManager) processBlockRequest(ctx context.Context, msg messaging
 		} else {
 
 			mngr.Router.Send("io_manager", messaging.Message{
+				MsgId:       msgId,
 				SourceId:    mngr.id,
 				ReplyTo:     msg.ReplyTo,
 				PayloadType: messaging.BlockRequest,
@@ -239,6 +371,7 @@ func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Me
 			}
 
 			mngr.Router.Broadcast(messaging.Message{
+				MsgId:       uuid.NewString(),
 				SourceId:    mngr.id,
 				ReplyTo:     "",
 				PayloadType: messaging.PieceInvalidated,
@@ -268,6 +401,7 @@ func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Me
 			mngr.Bitfield.Set(uint(data.Index))
 
 			mngr.Router.Broadcast(messaging.Message{
+				MsgId:       uuid.NewString(),
 				SourceId:    mngr.id,
 				ReplyTo:     mngr.id,
 				PayloadType: messaging.PieceValidated,
@@ -277,7 +411,11 @@ func (mngr *PieceManager) processBlockSend(ctx context.Context, msg messaging.Me
 				CreatedAt: time.Now(),
 			})
 
+			msgId := uuid.NewString()
+			mngr.SentMessages[msgId] = true
+
 			mngr.Router.Send("io_manager", messaging.Message{
+				MsgId:       msgId,
 				SourceId:    mngr.id,
 				ReplyTo:     mngr.id,
 				PayloadType: messaging.PieceSend,

@@ -5,13 +5,14 @@ import (
 	"crypto/rand"
 	"fmt"
 	"net"
+	"os/signal"
 	"strconv"
 	"sync"
+	"syscall"
 	"time"
 
-	"github.com/agaabrieel/bittorrent-client/pkg/apperrors"
+	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	"github.com/agaabrieel/bittorrent-client/pkg/io"
-	"github.com/agaabrieel/bittorrent-client/pkg/lifecycle"
 	logger "github.com/agaabrieel/bittorrent-client/pkg/log"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	metainfo "github.com/agaabrieel/bittorrent-client/pkg/metainfo"
@@ -23,15 +24,17 @@ import (
 const CLIENT_PORT = 6881
 
 type SessionManager struct {
-	id       string
-	Router   *messaging.Router
-	ClientId [20]byte
-	Port     int
-	Metainfo *metainfo.TorrentMetainfo
-	RecvCh   <-chan messaging.Message
-	ErrCh    chan error
-	wg       *sync.WaitGroup
-	mu       *sync.Mutex
+	id        string
+	Router    *messaging.Router
+	ClientId  [20]byte
+	Port      int
+	Metainfo  *metainfo.TorrentMetainfo
+	RecvCh    <-chan messaging.Message
+	ErrCh     chan error
+	wg        *sync.WaitGroup
+	mu        *sync.Mutex
+	ctx       context.Context
+	ctxCancel context.CancelFunc
 }
 
 func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, error) {
@@ -51,23 +54,25 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 		return nil, fmt.Errorf("failed to register component with id %s: %v", id, err)
 	}
 
-	return &SessionManager{
-		id:       id,
-		Router:   messaging.NewRouter(),
-		ClientId: clientId,
-		Metainfo: meta,
-		Port:     CLIENT_PORT,
-		RecvCh:   ch,
-		mu:       &sync.Mutex{},
-		wg:       &sync.WaitGroup{},
-	}, nil
+	ctx, ctxCancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 
+	return &SessionManager{
+		id:        id,
+		Router:    messaging.NewRouter(),
+		ClientId:  clientId,
+		Metainfo:  meta,
+		Port:      CLIENT_PORT,
+		RecvCh:    ch,
+		mu:        &sync.Mutex{},
+		wg:        &sync.WaitGroup{},
+		ctx:       ctx,
+		ctxCancel: ctxCancel,
+	}, nil
 }
 
 func (mngr *SessionManager) Run() {
 
-	lc, fatalErrCh := lifecycle.NewLifecycle(context.Background())
-	spawner := lc.Spawner()
+	fatalErrCh := make(chan any, 1)
 
 	ErrorHandler, errCh, err := apperrors.NewErrorHandler(fatalErrCh)
 	if err != nil {
@@ -99,26 +104,23 @@ func (mngr *SessionManager) Run() {
 		Logger.Panicf("failed to create io manager: %v", err)
 	}
 
-	lc.Go(ErrorHandler.Run)
-
-	lc.Go(func(ctx context.Context) {
-
-	})
+	mngr.wg.Add(1)
+	go ErrorHandler.Run(mngr.ctx)
 
 	mngr.wg.Add(1)
-	go Logger.Run(ctx, mngr.wg)
+	go Logger.Run(mngr.ctx, mngr.wg)
 
 	mngr.wg.Add(1)
-	go PeerOrchestrator.Run(ctx, mngr.wg)
+	go PeerOrchestrator.Run(mngr.ctx, mngr.wg)
 
 	mngr.wg.Add(1)
-	go PieceManager.Run(ctx, mngr.wg)
+	go PieceManager.Run(mngr.ctx, mngr.wg)
 
 	mngr.wg.Add(1)
-	go IOManager.Run(ctx, mngr.wg)
+	go IOManager.Run(mngr.ctx, mngr.wg)
 
 	mngr.wg.Add(1)
-	go TrackerManager.Run(ctx, mngr.wg)
+	go TrackerManager.Run(mngr.ctx, mngr.wg)
 
 	defer mngr.wg.Wait()
 
@@ -126,7 +128,6 @@ func (mngr *SessionManager) Run() {
 	if err != nil {
 		Logger.Panicf("failed to create io manager: %v", err)
 	}
-	defer listener.Close()
 
 	go func() {
 		for {
@@ -152,6 +153,12 @@ func (mngr *SessionManager) Run() {
 			})
 		}
 	}()
-	<-lc.Context().Done()
-	lc.Shutdown()
+
+	select {
+	case <-fatalErrCh:
+		mngr.ctxCancel()
+		listener.Close()
+	case <-mngr.ctx.Done():
+		listener.Close()
+	}
 }

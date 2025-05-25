@@ -14,8 +14,17 @@ const BLOCK_SIZE = 16 * 1024                    // 16KiB
 const BLOCK_BITFIELD_SIZE = 2 * 1024            // BLOCK_SIZE / 8 = 2KiB
 const PIECE_BUFFER_MAX_SIZE = 512 * 1024 * 1024 // 512 MiB
 
+type BlockStatus int
+
+const (
+	Pending BlockStatus = iota
+	Missing
+	Complete
+)
+
 type Piece struct {
 	BlockBitfield *bitset.BitSet
+	BlockStatuses []BlockStatus
 	Blocks        []byte
 }
 
@@ -62,7 +71,12 @@ func (pc *PieceCache) GetPiece(idx uint32) (*Piece, error) {
 
 		newPiece := &Piece{
 			Blocks:        make([]byte, pieceSize),
+			BlockStatuses: make([]BlockStatus, pieceSize),
 			BlockBitfield: bitset.New(BLOCK_BITFIELD_SIZE),
+		}
+
+		for i := range newPiece.BlockStatuses {
+			newPiece.BlockStatuses[i] = Missing
 		}
 
 		newPiece.BlockBitfield.ReadFrom(f)
@@ -149,7 +163,10 @@ func (pc *PieceCache) PutBlock(data []byte, idx, offset uint32) error {
 		return fmt.Errorf("failed to get piece %d: %w", idx, err)
 	}
 	copy(piece.Blocks[offset:], data)
-	piece.BlockBitfield.Set(uint(BLOCK_SIZE / offset))
+
+	blockIndex := uint(BLOCK_SIZE / offset)
+	piece.BlockBitfield.Set(blockIndex)
+	piece.BlockStatuses[blockIndex] = Complete
 	pc.putPiece(idx, piece)
 	return nil
 }
