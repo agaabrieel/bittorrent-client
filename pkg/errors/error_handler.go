@@ -31,7 +31,6 @@ const (
 )
 
 type Error struct {
-	Err         error
 	Message     string
 	Severity    ErrorSeverity
 	ErrorCode   ErrorCode
@@ -70,13 +69,12 @@ func (h *ErrorHandler) Run(ctx context.Context) {
 		return
 	case msg := <-h.RecvCh:
 		if msg.Err == nil {
-			h.Logger.Printf("[%+v] %v: %v (id=%v)", msg.Severity, msg.Err.Error(), msg.Message, msg.ComponentId)
+			h.Logger.Printf("[%+v] %v (id=%v)", msg.Severity, msg.Message, msg.ComponentId)
 			if msg.Severity == Critical {
 				select {
 				case h.FatalErrCh <- true:
 				case <-time.After(5 * time.Second):
 					h.Logger.Printf("Lifecycle manager channel is closed, exiting")
-					h.Logger.Printf("Error: %v", msg.Err)
 					h.Logger.Printf("Message: %v", msg.Message)
 					h.Logger.Printf("ComponentId: %v", msg.ComponentId)
 					h.Logger.Printf("Severity: %v", msg.Severity)

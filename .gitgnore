@@ -3,12 +3,12 @@
 ./*.bin
 ./*.txt
 ./*.log
-*.torrent
-*.txt
+./*.torrent
+./*.txt
 *.log
 ./.vscode
 *.json
 .vscode/launch.json
 *.log
-errors.log
+.errors.log
 log-*.txt

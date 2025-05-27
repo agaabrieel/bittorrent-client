@@ -95,10 +95,6 @@ type PieceInvalidatedPayload struct {
 	Index uint32
 }
 
-type ErrorPayload struct {
-	Msg string
-}
-
 type PeerBitfieldPayload struct {
 	Bitfield *bitset.BitSet
 }

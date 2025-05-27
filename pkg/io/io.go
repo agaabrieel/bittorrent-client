@@ -2,7 +2,6 @@ package io
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -23,7 +22,6 @@ type IOManager struct {
 	PieceSize    int64
 	SentMessages map[string]bool
 	RecvCh       <-chan messaging.Message
-	ErrCh        chan<- apperrors.Error
 	mu           sync.RWMutex
 	wg           sync.WaitGroup
 }
@@ -53,7 +51,6 @@ func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh cha
 		PieceSize:    int64(meta.InfoDict.PieceLength),
 		FileSize:     int64(meta.InfoDict.Length),
 		RecvCh:       ch,
-		ErrCh:        errCh,
 		SentMessages: make(map[string]bool),
 		mu:           sync.RWMutex{},
 		wg:           sync.WaitGroup{},
@@ -74,14 +71,21 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			if msg.ReplyingTo != "" {
 				mngr.mu.Lock()
 				exists := mngr.SentMessages[msg.ReplyingTo]
+
 				if !exists {
-					mngr.ErrCh <- apperrors.Error{
-						Err:         errors.New("unexpected message"),
-						Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: mngr.id,
-					}
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						MsgId:       uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyingTo:  msg.MsgId,
+						PayloadType: messaging.Error,
+						Payload: apperrors.Error{
+							Message:     fmt.Sprintf("unexpected message", msg.PayloadType, msg.ReplyingTo),
+							Severity:    apperrors.Warning,
+							Time:        time.Now(),
+							ComponentId: mngr.id,
+						},
+						CreatedAt: time.Now(),
+					})
 					continue
 				}
 				delete(mngr.SentMessages, msg.ReplyingTo)
@@ -104,8 +108,9 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 						mngr.Router.Send("", messaging.Message{
 							SourceId:    mngr.id,
 							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Msg: "type validation failed",
+							Payload: apperrors.Error{
+								Message:   "type validation failed",
+								ErrorCode: apperrors.ErrCodeInvalidPayload,
 							},
 							CreatedAt: time.Now(),
 						})
@@ -118,8 +123,9 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 						mngr.Router.Send("", messaging.Message{
 							SourceId:    mngr.id,
 							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Msg: fmt.Sprintf("file seek failed: %v", err),
+							Payload: apperrors.Error{
+								Message:   fmt.Sprintf("file seek failed: %s", err.Error()),
+								ErrorCode: apperrors,
 							},
 							CreatedAt: time.Now(),
 						})

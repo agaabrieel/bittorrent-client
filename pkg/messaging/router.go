@@ -5,6 +5,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 )
 
 type Router struct {
@@ -45,10 +47,10 @@ func (r *Router) Send(destId string, msg Message) {
 			r.MessageBuffer[msg] = destId
 			r.log(Message{
 				SourceId:    "router",
-				ReplyTo:     "router",
 				PayloadType: Error,
-				Payload: ErrorPayload{
-					Msg: "Channel is blocked. Adding message to message buffer for retries.",
+				Payload: apperrors.Error{
+					Message:  "Channel is blocked. Adding message to message buffer for retries.",
+					Severity: apperrors.Warning,
 				},
 				CreatedAt: time.Now(),
 			})
@@ -56,10 +58,10 @@ func (r *Router) Send(destId string, msg Message) {
 	} else {
 		r.log(Message{
 			SourceId:    "router",
-			ReplyTo:     "router",
 			PayloadType: Error,
-			Payload: ErrorPayload{
-				Msg: "Invalid destination Id. Dropping message.",
+			Payload: apperrors.Error{
+				Message:  "Channel is blocked. Adding message to message buffer for retries.",
+				Severity: apperrors.Warning,
 			},
 			CreatedAt: time.Now(),
 		})
@@ -102,8 +104,9 @@ func (r *Router) FlushMessageBuffer() {
 				SourceId:    "router",
 				ReplyTo:     "router",
 				PayloadType: Error,
-				Payload: ErrorPayload{
-					Msg: "Channel is blocked. Keeping message in message buffer for retries.",
+				Payload: apperrors.Error{
+					Message:  "Channel is blocked. Adding message to message buffer for retries.",
+					Severity: apperrors.Warning,
 				},
 				CreatedAt: time.Now(),
 			})
