@@ -4,18 +4,18 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
 	"time"
 
-	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	messaging "github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/bits-and-blooms/bitset"
 	"github.com/google/uuid"
 )
+
+const HANDSHAKE_SIZE int = 68
 
 type PeerMessageType uint8
 
@@ -58,11 +58,10 @@ type PeerManager struct {
 	wg              *sync.WaitGroup
 	mu              *sync.RWMutex
 	RecvCh          <-chan messaging.Message
-	ErrorCh         chan<- apperrors.Error
 	BlocksToRequest chan messaging.BlockRequestPayload
 }
 
-func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.WaitGroup, errCh chan<- apperrors.Error) *PeerManager {
+func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.WaitGroup) *PeerManager {
 
 	id, ch := uuid.New().String(), make(chan messaging.Message, 1024)
 
@@ -75,7 +74,6 @@ func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.
 		mu:              &sync.RWMutex{},
 		wg:              wg,
 		RecvCh:          ch,
-		ErrorCh:         errCh,
 		BlocksToRequest: make(chan messaging.BlockRequestPayload, 1024),
 	}
 }
@@ -91,13 +89,17 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	// Dials connection
 	conn, err := net.Dial("tcp", p.PeerAddr.String())
 	if err != nil {
-		p.ErrorCh <- apperrors.Error{
-			Err:         err,
-			Message:     "connection dialing failed",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("connection dialing failed: %s", err.Error()),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
@@ -115,14 +117,18 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	Handshake.Write(infohash[:])
 	Handshake.Write(clientId[:])
 
-	if Handshake.Len() != 68 {
-		p.ErrorCh <- apperrors.Error{
-			Err:         fmt.Errorf("incorrect handshake size: expected 68, got %d", Handshake.Len()),
-			Message:     "incorrect handshake size",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+	if Handshake.Len() != HANDSHAKE_SIZE {
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("incorrect handshake size: expected 68, got %d", Handshake.Len()),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
@@ -138,13 +144,17 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	for writtenBytes < Handshake.Len() {
 		n, err := conn.Write(Handshake.Bytes()[writtenBytes:])
 		if err != nil {
-			p.ErrorCh <- apperrors.Error{
-				Err:         err,
-				Message:     "failed to write to peer",
-				Severity:    apperrors.Warning,
-				Time:        time.Now(),
-				ComponentId: p.id,
-			}
+			p.Router.Send("peer_orchestrator", messaging.Message{
+				SourceId:    p.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Message:     fmt.Sprintf("failed to write to peer: %s", err.Error()),
+					Severity:    messaging.Warning,
+					Time:        time.Now(),
+					ComponentId: p.id,
+				},
+				CreatedAt: time.Now(),
+			})
 			return
 		}
 		writtenBytes += n
@@ -158,54 +168,70 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	}
 
 	// reads handshake response
-	responseBuffer := make([]byte, 68)
+	responseBuffer := make([]byte, HANDSHAKE_SIZE)
 	readBytes := 0
 	for readBytes < len(responseBuffer) {
 		n, err := conn.Read(responseBuffer[readBytes:])
 		if err != nil {
-			p.ErrorCh <- apperrors.Error{
-				Err:         err,
-				Message:     "failed to write to peer",
-				Severity:    apperrors.Warning,
-				Time:        time.Now(),
-				ComponentId: p.id,
-			}
+			p.Router.Send("peer_orchestrator", messaging.Message{
+				SourceId:    p.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Message:     fmt.Sprintf("failed to write to peer: %s", err.Error()),
+					Severity:    messaging.Warning,
+					Time:        time.Now(),
+					ComponentId: p.id,
+				},
+				CreatedAt: time.Now(),
+			})
 			return
 		}
 		readBytes += n
 	}
 
 	if !bytes.Equal(responseBuffer[0:28], Handshake.Bytes()[:28]) {
-		p.ErrorCh <- apperrors.Error{
-			Err:         fmt.Errorf("incorrect handshake, expected %v, got %v", responseBuffer[0:28], Handshake.Bytes()[:28]),
-			Message:     "failed to write to peer",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("incorrect handshake, expected %v, got %v", responseBuffer[0:28], Handshake.Bytes()[:28]),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
 	if !bytes.Equal(responseBuffer[28:48], Handshake.Bytes()[28:48]) {
-		p.ErrorCh <- apperrors.Error{
-			Err:         fmt.Errorf("infohash doesn't match, expected %v, got %v", responseBuffer[28:48], Handshake.Bytes()[28:48]),
-			Message:     "failed to write to peer",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("infohash doesn't match, expected %v, got %v", responseBuffer[28:48], Handshake.Bytes()[28:48]),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
 	peerID := *(*[20]byte)(responseBuffer[48:68])
 	if p.PeerId != peerID && p.PeerId != [20]byte{} {
-		p.ErrorCh <- apperrors.Error{
-			Err:         fmt.Errorf("peer id changed, expected %v, got %v", p.PeerId, peerID),
-			Message:     "failed to write to peer",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("peer id changed, expected %v, got %v", p.PeerId, peerID),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
@@ -219,8 +245,7 @@ func (p *PeerManager) startPeerHandshake(ctx context.Context, infohash [20]byte,
 	p.PeerAddr = conn.RemoteAddr()
 	p.LastMessage = PeerMessage{}
 
-	p.wg.Add(1)
-	go p.mainLoop(childCtx)
+	p.mainLoop(childCtx)
 }
 
 func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byte, clientId [20]byte) {
@@ -242,13 +267,17 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	for readBytes < len(handshakeBuffer) {
 		n, err := p.PeerConn.Read(handshakeBuffer[readBytes:])
 		if err != nil {
-			p.ErrorCh <- apperrors.Error{
-				Err:         err,
-				Message:     "failed to read from peer",
-				Severity:    apperrors.Warning,
-				Time:        time.Now(),
-				ComponentId: p.id,
-			}
+			p.Router.Send("peer_orchestrator", messaging.Message{
+				SourceId:    p.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Message:     fmt.Sprintf("failed to read from peer: %s", err.Error()),
+					Severity:    messaging.Warning,
+					Time:        time.Now(),
+					ComponentId: p.id,
+				},
+				CreatedAt: time.Now(),
+			})
 			p.PeerConn.Close()
 			return
 		}
@@ -256,13 +285,17 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	}
 
 	if len(handshakeBuffer) != 68 {
-		p.ErrorCh <- apperrors.Error{
-			Err:         fmt.Errorf("incorrect handshake size, got %d", len(handshakeBuffer)),
-			Message:     "failed to establish a connection with a peer",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("incorrect handshake size, got %d", len(handshakeBuffer)),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		p.PeerConn.Close()
 		return
 	}
@@ -276,25 +309,33 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	handshake.Write(clientId[:])
 
 	if !bytes.Equal(handshakeBuffer[0:28], handshake.Bytes()[:28]) {
-		p.ErrorCh <- apperrors.Error{
-			Err:         fmt.Errorf("incorrect handshake"),
-			Message:     "failed to establish a connection with a peer",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("incorrect handshake, expected %v, got %v", handshakeBuffer[0:28], handshake.Bytes()[:28]),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		p.PeerConn.Close()
 		return
 	}
 
 	if !bytes.Equal(handshakeBuffer[28:48], handshake.Bytes()[28:48]) {
-		p.ErrorCh <- apperrors.Error{
-			Err:         fmt.Errorf("infohash doesn't match, expected %v, got %v", handshakeBuffer[28:48], handshake.Bytes()[28:48]),
-			Message:     "failed to write to peer",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("infohash doesn't match, expected %v, got %v", handshakeBuffer[28:48], handshake.Bytes()[28:48]),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		p.PeerConn.Close()
 		return
 	}
@@ -313,13 +354,17 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	for writtenBytes < handshake.Len() {
 		n, err := p.PeerConn.Write(handshake.Bytes()[writtenBytes:])
 		if err != nil {
-			p.ErrorCh <- apperrors.Error{
-				Err:         err,
-				Message:     "failed writing to socket",
-				Severity:    apperrors.Warning,
-				Time:        time.Now(),
-				ComponentId: p.id,
-			}
+			p.Router.Send("peer_orchestrator", messaging.Message{
+				SourceId:    p.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Message:     fmt.Sprintf("failed to write to socket: %s", err.Error()),
+					Severity:    messaging.Warning,
+					Time:        time.Now(),
+					ComponentId: p.id,
+				},
+				CreatedAt: time.Now(),
+			})
 			p.PeerConn.Close()
 			return
 		}
@@ -334,9 +379,7 @@ func (p *PeerManager) replyToPeerHandshake(ctx context.Context, infohash [20]byt
 	p.LastActive = time.Now()
 	p.LastMessage = PeerMessage{}
 
-	p.wg.Add(1)
-	go p.mainLoop(childCtx)
-
+	p.mainLoop(childCtx)
 }
 
 func (p *PeerManager) mainLoop(ctx context.Context) {
@@ -367,13 +410,17 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 	bitfieldMsg, err := generateBitfieldMsg(*p.OurBitfield)
 	if err != nil {
-		p.ErrorCh <- apperrors.Error{
-			Err:         err,
-			Message:     "failed to generate bitfield message",
-			Severity:    apperrors.Critical,
-			Time:        time.Now(),
-			ComponentId: p.id,
-		}
+		p.Router.Send("peer_orchestrator", messaging.Message{
+			SourceId:    p.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("failed to generate bitfield message: %s", err.Error()),
+				Severity:    messaging.Warning,
+				Time:        time.Now(),
+				ComponentId: p.id,
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
@@ -437,10 +484,9 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						msgId := uuid.NewString()
 						p.SentMessages[msgId] = true
 						p.Router.Send("peer_orchestrator", messaging.Message{
-							MsgId:       msgId,
+							Id:          msgId,
 							SourceId:    p.id,
 							ReplyTo:     p.id,
-							ReplyingTo:  "",
 							PayloadType: messaging.PeerBitfield,
 							Payload: messaging.PeerBitfieldPayload{
 								Bitfield: p.PeerBitfield,
@@ -468,10 +514,9 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						msgId := uuid.NewString()
 						p.SentMessages[msgId] = true
 						p.Router.Send("peer_orchestrator", messaging.Message{
-							MsgId:       msgId,
+							Id:          msgId,
 							SourceId:    p.id,
 							ReplyTo:     p.id,
-							ReplyingTo:  "",
 							PayloadType: messaging.PeerBitfieldUpdate,
 							Payload: messaging.PeerBitfieldUpdatePayload{
 								Index: int(pieceIndex),
@@ -485,7 +530,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						p.SentMessages[msgId] = true
 
 						p.Router.Send("piece_manager", messaging.Message{
-							MsgId:       msgId,
+							Id:          msgId,
 							SourceId:    p.id,
 							ReplyTo:     p.id,
 							ReplyingTo:  "",
@@ -504,7 +549,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 						p.SentMessages[msgId] = true
 
 						p.Router.Send("piece_manager", messaging.Message{
-							MsgId:       msgId,
+							Id:          msgId,
 							SourceId:    p.id,
 							ReplyTo:     p.id,
 							ReplyingTo:  "",
@@ -539,13 +584,19 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 					p.mu.Lock()
 					exists := p.SentMessages[msg.ReplyingTo]
 					if !exists {
-						p.ErrorCh <- apperrors.Error{
-							Err:         errors.New("unexpected message"),
-							Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
-							Severity:    apperrors.Warning,
-							Time:        time.Now(),
-							ComponentId: p.id,
-						}
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    p.id,
+							ReplyingTo:  msg.Id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeUnexpectedMessage,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							},
+							CreatedAt: time.Now(),
+						})
 						continue
 					}
 					delete(p.SentMessages, msg.ReplyingTo)
@@ -554,56 +605,70 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 				if msg.ReplyTo != "" {
 					p.Router.Send(msg.ReplyTo, messaging.Message{
-						MsgId:       uuid.NewString(),
+						Id:          uuid.NewString(),
 						SourceId:    p.id,
-						ReplyTo:     "",
-						ReplyingTo:  "",
+						ReplyingTo:  msg.Id,
 						PayloadType: messaging.Acknowledged,
 						Payload:     nil,
 						CreatedAt:   time.Now(),
 					})
 				}
 
-				defer p.wg.Done()
-
 				switch msg.PayloadType {
 				case messaging.BlockSend:
 
 					payload, ok := msg.Payload.(messaging.BlockSendPayload)
 					if !ok {
-						p.ErrorCh <- apperrors.Error{
-							Err:         errors.New("incorrect payload"),
-							Message:     fmt.Sprintf("expected BlockSendPayload, got %v", payload),
-							Severity:    apperrors.Warning,
-							Time:        time.Now(),
-							ComponentId: p.id,
-						}
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    p.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected BlockSendPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							},
+							CreatedAt: time.Now(),
+						})
 						return
 					}
 
 					if p.IsInterested && !p.IsChoking {
 						peerConnSendCh <- generatePieceMsg(payload.Index, payload.Offset, payload.Data)
 					} else {
-						p.ErrorCh <- apperrors.Error{
-							Err:         errors.New("peer is not interested or is choking"),
-							Message:     fmt.Sprintf("dropping message %v", payload),
-							Severity:    apperrors.Warning,
-							Time:        time.Now(),
-							ComponentId: p.id,
-						}
+
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    p.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     "peer is not interested or choking",
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							},
+							CreatedAt: time.Now(),
+						})
+
 					}
 
 				case messaging.PieceValidated:
 
 					payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
 					if !ok {
-						p.ErrorCh <- apperrors.Error{
-							Err:         errors.New("incorrect payload"),
-							Message:     fmt.Sprintf("expected PieceValidatedPayload, got %v", payload),
-							Severity:    apperrors.Warning,
-							Time:        time.Now(),
-							ComponentId: p.id,
-						}
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    p.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected PieceValidatedPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							},
+							CreatedAt: time.Now(),
+						})
 					}
 
 					p.mu.Lock()
@@ -615,13 +680,18 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 					payload, ok := msg.Payload.(messaging.NextBlockIndexSendPayload)
 					if !ok {
-						p.ErrorCh <- apperrors.Error{
-							Err:         errors.New("incorrect payload"),
-							Message:     fmt.Sprintf("expected NextBlockIndexSendPayload, got %v", payload),
-							Severity:    apperrors.Warning,
-							Time:        time.Now(),
-							ComponentId: p.id,
-						}
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    p.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected NextBlockIndexSendPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							},
+							CreatedAt: time.Now(),
+						})
 					}
 
 					p.BlocksToRequest <- messaging.BlockRequestPayload{
@@ -662,7 +732,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 		p.SentMessages[msgId] = true
 
 		p.Router.Send("", messaging.Message{
-			MsgId:       msgId,
+			Id:          msgId,
 			SourceId:    p.id,
 			ReplyTo:     p.id,
 			ReplyingTo:  "",
@@ -699,23 +769,35 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 
 			n, err := p.PeerConn.Read(buf)
 			if err != nil {
+
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					p.ErrorCh <- apperrors.Error{
-						Err:         err,
-						Message:     "reading timed-out, closing connection",
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: p.id,
-					}
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("reading timed-out, closing connection: %s", err.Error()),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
 					return
 				}
-				p.ErrorCh <- apperrors.Error{
-					Err:         err,
-					Message:     "read error",
-					Severity:    apperrors.Warning,
-					Time:        time.Now(),
-					ComponentId: p.id,
-				}
+
+				p.Router.Send("peer_orchestrator", messaging.Message{
+					SourceId:    p.id,
+					PayloadType: messaging.Error,
+					Payload: messaging.ErrorPayload{
+						Message:     fmt.Sprintf("read error: %s", err.Error()),
+						Severity:    messaging.Warning,
+						ErrorCode:   messaging.ErrCodeInvalidPayload,
+						Time:        time.Now(),
+						ComponentId: p.id,
+					},
+					CreatedAt: time.Now(),
+				})
 				return
 			}
 
@@ -733,14 +815,20 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 
 				fullMsg := make([]byte, msgLen)
 				_, err := readBuf.Read(fullMsg)
+
 				if err != nil {
-					p.ErrorCh <- apperrors.Error{
-						Err:         err,
-						Message:     "buffer read error",
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: p.id,
-					}
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("buffer read error: %s", err.Error()),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
 				}
 
 				if msgLen == 4 {
@@ -784,26 +872,36 @@ func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 				if err != nil {
 
 					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-						p.ErrorCh <- apperrors.Error{
-							Err:         err,
-							Message:     "write timed out",
-							Severity:    apperrors.Warning,
-							Time:        time.Now(),
-							ComponentId: p.id,
-						}
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    p.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("writer timed out: %s", err.Error()),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							},
+							CreatedAt: time.Now(),
+						})
 						return
 
 					} else if err == io.EOF {
 						return
 					}
 
-					p.ErrorCh <- apperrors.Error{
-						Err:         err,
-						Message:     "write error",
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: p.id,
-					}
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("write error: %s", err.Error()),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidConnection,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
 					return
 				}
 			}

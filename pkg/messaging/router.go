@@ -5,8 +5,6 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 )
 
 type Router struct {
@@ -40,6 +38,10 @@ func (r *Router) Send(destId string, msg Message) {
 
 	r.log(msg)
 
+	if msg.PayloadType == Error {
+
+	}
+
 	if ch, ok := r.Registry[destId]; ok {
 		select {
 		case ch <- msg:
@@ -48,9 +50,9 @@ func (r *Router) Send(destId string, msg Message) {
 			r.log(Message{
 				SourceId:    "router",
 				PayloadType: Error,
-				Payload: apperrors.Error{
+				Payload: ErrorPayload{
 					Message:  "Channel is blocked. Adding message to message buffer for retries.",
-					Severity: apperrors.Warning,
+					Severity: Warning,
 				},
 				CreatedAt: time.Now(),
 			})
@@ -59,9 +61,9 @@ func (r *Router) Send(destId string, msg Message) {
 		r.log(Message{
 			SourceId:    "router",
 			PayloadType: Error,
-			Payload: apperrors.Error{
-				Message:  "Channel is blocked. Adding message to message buffer for retries.",
-				Severity: apperrors.Warning,
+			Payload: ErrorPayload{
+				Message:  "Unknown destination id.",
+				Severity: Warning,
 			},
 			CreatedAt: time.Now(),
 		})
@@ -102,11 +104,10 @@ func (r *Router) FlushMessageBuffer() {
 		default:
 			r.log(Message{
 				SourceId:    "router",
-				ReplyTo:     "router",
 				PayloadType: Error,
-				Payload: apperrors.Error{
+				Payload: ErrorPayload{
 					Message:  "Channel is blocked. Adding message to message buffer for retries.",
-					Severity: apperrors.Warning,
+					Severity: Warning,
 				},
 				CreatedAt: time.Now(),
 			})

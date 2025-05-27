@@ -14,13 +14,14 @@ import (
 	"sync"
 	"time"
 
-	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	parser "github.com/agaabrieel/bittorrent-client/pkg/parser"
+	"github.com/google/uuid"
 )
 
 const ProtocolID uint64 = 0x41727101980
+const UDPPacketSize int = 98
 
 type Action uint8
 
@@ -70,9 +71,19 @@ type Tracker struct {
 }
 
 type PeerAddr struct {
-	id   [20]byte
-	ip   net.IP
-	port uint16
+	id       [20]byte
+	protocol string
+	ip       net.IP
+	port     uint16
+}
+
+func (addr PeerAddr) Network() string {
+	return addr.protocol
+}
+
+func (addr PeerAddr) String() string {
+	strPort := strconv.Itoa(int(addr.port))
+	return addr.ip.String() + ":" + strPort
 }
 
 type TrackerManager struct {
@@ -82,20 +93,22 @@ type TrackerManager struct {
 	ClientId                 [20]byte
 	Metainfo                 *metainfo.TorrentMetainfo
 	RecvCh                   <-chan messaging.Message
+	TrackerErrCh             chan error
 	AnnounceRespCh           chan AnnounceResponse
-	ErrCh                    chan<- apperrors.Error
 	IsWaitingForAnnounceData bool
 	wg                       *sync.WaitGroup
 	mu                       *sync.Mutex
 }
 
-func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error, clientId [20]byte) (*TrackerManager, error) {
+func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*TrackerManager, error) {
 
 	id, ch := "tracker_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
 	if err != nil {
 		return nil, fmt.Errorf("failed to register component with id %v: %v", id, err)
 	}
+
+	trackerErrCh := make(chan error, 1024)
 
 	return &TrackerManager{
 		id:             id,
@@ -104,8 +117,8 @@ func NewTrackerManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errC
 		Metainfo:       meta,
 		ClientId:       clientId,
 		RecvCh:         ch,
+		TrackerErrCh:   trackerErrCh,
 		AnnounceRespCh: make(chan AnnounceResponse, 1),
-		ErrCh:          errCh,
 		wg:             &sync.WaitGroup{},
 		mu:             &sync.Mutex{},
 	}, nil
@@ -119,26 +132,36 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 	err := mngr.setupTracker(childCtx)
 	if err != nil {
-		mngr.ErrCh <- apperrors.Error{
-			Err:         err,
-			Message:     "failed to setup tracker",
-			Severity:    apperrors.Critical,
-			ErrorCode:   apperrors.ErrCodeInvalidTracker,
-			Time:        time.Now(),
-			ComponentId: "tracker_manager",
-		}
+		mngr.Router.Send("error_handler", messaging.Message{
+			Id:          uuid.NewString(),
+			SourceId:    mngr.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     fmt.Sprintf("failed to setup tracker: %s", err.Error()),
+				Severity:    messaging.Critical,
+				ErrorCode:   messaging.ErrCodeInvalidTracker,
+				Time:        time.Now(),
+				ComponentId: "tracker_manager",
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
 	if mngr.Tracker == nil {
-		mngr.ErrCh <- apperrors.Error{
-			Err:         errors.New("tracker is nil"),
-			Message:     "tracker is nil",
-			Severity:    apperrors.Critical,
-			ErrorCode:   apperrors.ErrCodeInvalidTracker,
-			Time:        time.Now(),
-			ComponentId: "tracker_manager",
-		}
+		mngr.Router.Send("error_handler", messaging.Message{
+			Id:          uuid.NewString(),
+			SourceId:    mngr.id,
+			PayloadType: messaging.Error,
+			Payload: messaging.ErrorPayload{
+				Message:     "tracker is nil",
+				Severity:    messaging.Critical,
+				ErrorCode:   messaging.ErrCodeInvalidTracker,
+				Time:        time.Now(),
+				ComponentId: "tracker_manager",
+			},
+			CreatedAt: time.Now(),
+		})
 		return
 	}
 
@@ -164,25 +187,35 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 				payload, ok := msg.Payload.(messaging.AnnounceDataSendPayload)
 				if !ok {
-					mngr.ErrCh <- apperrors.Error{
-						Err:         err,
-						Message:     "router sent wrong datatype",
-						Severity:    apperrors.Critical,
-						Time:        time.Now(),
-						ComponentId: "tracker_manager",
-					}
+					mngr.Router.Send("error_handler", messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     "incorrect payload",
+							Severity:    messaging.Critical,
+							Time:        time.Now(),
+							ComponentId: "tracker_manager",
+						},
+						CreatedAt: time.Now(),
+					})
 					return
 				}
 
 				port, err := strconv.Atoi(mngr.Tracker.url.Port())
 				if err != nil {
-					mngr.ErrCh <- apperrors.Error{
-						Err:         err,
-						Message:     "failed to parse tracker port",
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: "tracker_manager",
-					}
+					mngr.Router.Send("error_handler", messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("failed to convert port to int: %s", err.Error()),
+							Severity:    messaging.Critical,
+							Time:        time.Now(),
+							ComponentId: "tracker_manager",
+						},
+						CreatedAt: time.Now(),
+					})
 					return
 				}
 
@@ -197,7 +230,7 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 				}
 
 				mngr.wg.Add(1)
-				go mngr.Tracker.Announce(childCtx, mngr.wg, req, mngr.AnnounceRespCh, mngr.ErrCh)
+				go mngr.Tracker.Announce(childCtx, mngr.wg, req, mngr.AnnounceRespCh, mngr.TrackerErrCh)
 			}
 
 		case msg := <-mngr.AnnounceRespCh:
@@ -208,21 +241,21 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			newPeers := make([]net.Addr, 256)
 			for _, peer := range msg.peers {
 				if !mngr.Tracker.peerMap[peer.id] {
-
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						ReplyTo:     mngr.id,
-						PayloadType: messaging.PeersDiscovered,
-						Payload: messaging.PeersDiscoveredPayload{
-							Addrs: newPeers,
-						},
-						CreatedAt: time.Now(),
-					})
-
 					mngr.Tracker.peers = append(mngr.Tracker.peers, peer)
 					mngr.Tracker.peerMap[peer.id] = true
+					newPeers = append(newPeers, peer)
 				}
 			}
+
+			mngr.Router.Send("peer_orchestrator", messaging.Message{
+				SourceId:    mngr.id,
+				ReplyTo:     mngr.id,
+				PayloadType: messaging.PeersDiscovered,
+				Payload: messaging.PeersDiscoveredPayload{
+					Addrs: newPeers,
+				},
+				CreatedAt: time.Now(),
+			})
 
 		case <-trackerInterval.C:
 
@@ -241,7 +274,6 @@ func (mngr *TrackerManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			}
 
 		case <-ctx.Done():
-			ctxCancel()
 			return
 		}
 	}
@@ -264,181 +296,146 @@ func (mngr *TrackerManager) setupTracker(ctx context.Context) error {
 
 	trackerResponseCh := make(chan AnnounceResponse, 1)
 
-	if mngr.Metainfo.AnnounceList == nil {
+	var trackerURLs []string
+	if mngr.Metainfo.AnnounceList != nil {
+		for _, trackers := range mngr.Metainfo.AnnounceList {
+			trackerURLs = append(trackerURLs, trackers...)
+		}
+	} else if mngr.Metainfo.Announce != "" {
+		trackerURLs = append(trackerURLs, mngr.Metainfo.Announce)
+	}
 
-		trackerUrl, err := url.Parse(mngr.Metainfo.Announce)
+	for _, tracker := range trackerURLs {
+		trackerUrl, err := url.Parse(tracker)
 
 		if err != nil {
-			return errors.New("failed to parse announce url")
+			mngr.Router.Send("error_handler", messaging.Message{
+				Id:          uuid.NewString(),
+				SourceId:    mngr.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Message:     fmt.Sprintf("failed to parse tracker url: %s", err.Error()),
+					Severity:    messaging.Critical,
+					Time:        time.Now(),
+					ComponentId: mngr.id,
+				},
+				CreatedAt: time.Now(),
+			})
+			continue
 		}
 
 		tracker := NewTracker(trackerUrl)
-
 		childCtx, ctxCancel := context.WithTimeout(ctx, 30*time.Second)
 		defer ctxCancel()
 
 		var port int
-		if trackerUrl.Scheme == "udp" {
+		switch trackerUrl.Scheme {
+		case "udp":
 			port, err = strconv.Atoi(trackerUrl.Port())
 			if err != nil {
-				return errors.New("failed to parse tracker port")
+				mngr.Router.Send("error_handler", messaging.Message{
+					Id:          uuid.NewString(),
+					SourceId:    mngr.id,
+					PayloadType: messaging.Error,
+					Payload: messaging.ErrorPayload{
+						Message:     fmt.Sprintf("failed to parse tracker url: %s", err.Error()),
+						Severity:    messaging.Critical,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					},
+					CreatedAt: time.Now(),
+				})
+
+				continue
 			}
-		} else if trackerUrl.Scheme == "http" {
+		case "http":
 			port = 80
-		} else if trackerUrl.Scheme == "https" {
+		case "https":
 			port = 443
 		}
 
 		req.port = uint16(port)
 
 		mngr.wg.Add(1)
-		go tracker.Announce(childCtx, mngr.wg, req, trackerResponseCh, mngr.ErrCh)
+		go tracker.Announce(childCtx, mngr.wg, req, trackerResponseCh, mngr.TrackerErrCh)
 
 		select {
 		case trackerResponse := <-trackerResponseCh:
+
 			mngr.wg.Wait()
 			close(trackerResponseCh)
+
+			if trackerResponse.tracker == nil || len(trackerResponse.peers) == 0 {
+				mngr.Router.Send("error_handler", messaging.Message{
+					Id:          uuid.NewString(),
+					SourceId:    mngr.id,
+					PayloadType: messaging.Error,
+					Payload: messaging.ErrorPayload{
+						Message:     "tracker response is nil",
+						Severity:    messaging.Critical,
+						Time:        time.Now(),
+						ComponentId: mngr.id,
+					},
+					CreatedAt: time.Now(),
+				})
+				continue
+			}
+
 			mngr.Tracker = trackerResponse.tracker
 			mngr.Tracker.interval = trackerResponse.interval
 			mngr.Tracker.peers = trackerResponse.peers
-
 			for _, p := range mngr.Tracker.peers {
 				mngr.Tracker.peerMap[p.id] = true
 			}
 
 			return nil
 
+		case <-time.After(30 * time.Second):
+			mngr.Router.Send("error_handler", messaging.Message{
+				Id:          uuid.NewString(),
+				SourceId:    mngr.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
+					Message:     "tracker response timed out",
+					Severity:    messaging.Critical,
+					Time:        time.Now(),
+					ComponentId: mngr.id,
+				},
+				CreatedAt: time.Now(),
+			})
+			continue
 		case <-ctx.Done():
-			return errors.New("announcer response timed out")
-		}
 
-	} else {
-		for _, trackers := range mngr.Metainfo.AnnounceList {
-
-			if len(trackers) == 0 {
-				continue
-			}
-
-			for _, tracker := range trackers {
-
-				trackerUrl, err := url.Parse(tracker)
-				if err != nil {
-					mngr.ErrCh <- apperrors.Error{
-						Err:         err,
-						Message:     "failed to parse tracker url",
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: "tracker_manager",
-					}
-					continue
-				}
-
-				tracker := NewTracker(trackerUrl)
-
-				childCtx, ctxCancel := context.WithTimeout(ctx, 30*time.Second)
-				defer ctxCancel()
-
-				var port int
-				if trackerUrl.Scheme == "udp" {
-					port, err = strconv.Atoi(trackerUrl.Port())
-					if err != nil {
-						mngr.ErrCh <- apperrors.Error{
-							Err:         err,
-							Message:     "failed to parse tracker port",
-							Severity:    apperrors.Warning,
-							Time:        time.Now(),
-							ComponentId: "tracker_manager",
-						}
-						continue
-					}
-				} else if trackerUrl.Scheme == "http" {
-					port = 80
-				} else if trackerUrl.Scheme == "https" {
-					port = 443
-				}
-
-				req.port = uint16(port)
-
-				mngr.wg.Add(1)
-				go tracker.Announce(childCtx, mngr.wg, req, trackerResponseCh, mngr.ErrCh)
-			}
-
-			select {
-			case trackerResponse := <-trackerResponseCh:
-
-				mngr.wg.Wait()
-				close(trackerResponseCh)
-
-				if trackerResponse.tracker == nil {
-					mngr.ErrCh <- apperrors.Error{
-						Err:         errors.New("tracker response is nil"),
-						Message:     "tracker response is nil",
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: "tracker_manager",
-					}
-					continue
-				}
-
-				if len(trackerResponse.peers) == 0 {
-					mngr.ErrCh <- apperrors.Error{
-						Err:         errors.New("tracker response has no peers"),
-						Message:     "tracker response has no peers",
-						Severity:    apperrors.Warning,
-						Time:        time.Now(),
-						ComponentId: "tracker_manager",
-					}
-					continue
-				}
-
-				mngr.Tracker = trackerResponse.tracker
-				mngr.Tracker.interval = trackerResponse.interval
-				mngr.Tracker.peers = trackerResponse.peers
-
-				for _, p := range mngr.Tracker.peers {
-					mngr.Tracker.peerMap[p.id] = true
-				}
-
-				return nil
-
-			case <-time.After(30 * time.Second):
-				mngr.ErrCh <- apperrors.Error{
-					Err:         errors.New("tracker response timed out"),
+			mngr.Router.Send("error_handler", messaging.Message{
+				Id:          uuid.NewString(),
+				SourceId:    mngr.id,
+				PayloadType: messaging.Error,
+				Payload: messaging.ErrorPayload{
 					Message:     "tracker response timed out",
-					Severity:    apperrors.Warning,
+					Severity:    messaging.Critical,
 					Time:        time.Now(),
-					ComponentId: "tracker_manager",
-				}
-				continue
-			case <-ctx.Done():
+					ComponentId: mngr.id,
+				},
+				CreatedAt: time.Now(),
+			})
 
-				mngr.ErrCh <- apperrors.Error{
-					Err:         errors.New("tracker response timed out"),
-					Message:     "tracker response timed out",
-					Severity:    apperrors.Warning,
-					Time:        time.Now(),
-					ComponentId: "tracker_manager",
-				}
+			mngr.Tracker.interval = 0
+			mngr.Tracker.peers = nil
+			mngr.Tracker.peerMap = nil
+			mngr.Tracker = nil
+			mngr.wg.Wait()
+			close(trackerResponseCh)
+			mngr.AnnounceRespCh = nil
+			mngr.RecvCh = nil
+			mngr.ClientId = [20]byte{}
+			mngr.Metainfo = nil
+			mngr.IsWaitingForAnnounceData = false
+			mngr.wg = nil
+			mngr.mu = nil
+			mngr.Router = nil
+			mngr.id = ""
 
-				mngr.Tracker.interval = 0
-				mngr.Tracker.peers = nil
-				mngr.Tracker.peerMap = nil
-				mngr.Tracker = nil
-				mngr.wg.Wait()
-				close(trackerResponseCh)
-				mngr.AnnounceRespCh = nil
-				mngr.ErrCh = nil
-				mngr.RecvCh = nil
-				mngr.ClientId = [20]byte{}
-				mngr.Metainfo = nil
-				mngr.IsWaitingForAnnounceData = false
-				mngr.wg = nil
-				mngr.mu = nil
-				mngr.Router = nil
-				mngr.id = ""
-
-				return fmt.Errorf("tracker response timed out")
-			}
+			return fmt.Errorf("tracker response timed out")
 		}
 	}
 	return nil
@@ -472,7 +469,7 @@ func NewTracker(trackerUrl *url.URL) *Tracker {
 	}
 }
 
-func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req AnnounceRequest, respCh chan<- AnnounceResponse, errCh chan<- apperrors.Error) {
+func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req AnnounceRequest, respCh chan<- AnnounceResponse, errCh chan error) {
 
 	childCtx, ctxCancel := context.WithCancel(ctx)
 	defer ctxCancel()
@@ -480,36 +477,18 @@ func (t *Tracker) Announce(ctx context.Context, wg *sync.WaitGroup, req Announce
 	defer wg.Done()
 
 	if t.client == nil {
-		errCh <- apperrors.Error{
-			Err:         fmt.Errorf("tracker does not implement client"),
-			Message:     "tracker does not implement client",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: "tracker_manager",
-		}
+		errCh <- errors.New("tracker does not implement client")
 		return
 	}
 
 	resp, err := t.client.Announce(childCtx, t.url, req)
 	if err != nil {
-		errCh <- apperrors.Error{
-			Err:         err,
-			Message:     "failed tracker announce",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: "tracker_manager",
-		}
+		errCh <- fmt.Errorf("failed tracker announce: %v", err)
 		return
 	}
 
 	if resp == nil {
-		errCh <- apperrors.Error{
-			Err:         fmt.Errorf("tracker response is nil"),
-			Message:     "tracker response is nil",
-			Severity:    apperrors.Warning,
-			Time:        time.Now(),
-			ComponentId: "tracker_manager",
-		}
+		errCh <- errors.New("tracker response is nil")
 		return
 	}
 
@@ -594,8 +573,9 @@ func (c *HTTPClient) Announce(ctx context.Context, trackerUrl *url.URL, req Anno
 	}
 
 	params := url.Values{}
-	params.Set("info_hash", string(req.infoHash[:]))
-	params.Set("peer_id", string(req.peerID[:]))
+
+	params.Set("info_hash", url.QueryEscape(string(req.infoHash[:])))
+	params.Set("peer_id", url.QueryEscape(string(req.peerID[:])))
 	params.Set("port", strconv.Itoa(int(req.port)))
 
 	uploaded := strconv.Itoa(int(req.uploaded))
@@ -701,7 +681,7 @@ func (c *UDPClient) makeAnnounceRequest(ctx context.Context, connId uint64, req 
 		return nil, fmt.Errorf("invalid announce response: %w", err)
 	}
 
-	if n != 98 {
+	if n != UDPPacketSize {
 		return nil, fmt.Errorf("wrote %d bytes, expected 98 bytes", n)
 	}
 

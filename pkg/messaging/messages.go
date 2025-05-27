@@ -30,14 +30,48 @@ const (
 	Error
 )
 
+type ErrorSeverity uint8
+
+const (
+	Info ErrorSeverity = iota
+	Warning
+	Critical
+)
+
+type ErrorCode uint8
+
+const (
+	ErrCodeContextCancelled ErrorCode = iota
+	ErrCodeInvalidMessage
+	ErrCodeInvalidPayload
+	ErrCodeInvalidBlock
+	ErrCodeInvalidConnection
+	ErrCodeInvalidTracker
+	ErrCodeInvalidPiece
+	ErrCodeInvalidRequest
+	ErrCodeInvalidResponse
+	ErrCodeInvalidFile
+	ErrCodeUnexpectedMessage
+	ErrCodeInternalError
+	ErrCodeSocketError
+)
+
 type Message struct {
-	MsgId       string
+	Id          string
 	SourceId    string
 	ReplyTo     string
 	ReplyingTo  string
 	PayloadType MessageType
 	Payload     any
 	CreatedAt   time.Time
+}
+
+type ErrorPayload struct {
+	Message     string
+	Severity    ErrorSeverity
+	ErrorCode   ErrorCode
+	Time        time.Time
+	ComponentId string
 }
 
 type BroadcastedMessage struct {

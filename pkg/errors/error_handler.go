@@ -1,89 +1,61 @@
-package apperrors
+package errors
 
 import (
 	"context"
-	"log"
-	"os"
+	"fmt"
 	"time"
+
+	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 )
-
-type ErrorSeverity uint8
-
-const (
-	Info ErrorSeverity = iota
-	Warning
-	Critical
-)
-
-type ErrorCode uint8
-
-const (
-	ErrCodeContextCancelled ErrorCode = iota
-	ErrCodeInvalidMessage
-	ErrCodeInvalidPayload
-	ErrCodeInvalidBlock
-	ErrCodeInvalidConnection
-	ErrCodeInvalidTracker
-	ErrCodeInvalidPiece
-	ErrCodeInvalidRequest
-	ErrCodeInvalidResponse
-	ErrCodeInvalidFile
-)
-
-type Error struct {
-	Message     string
-	Severity    ErrorSeverity
-	ErrorCode   ErrorCode
-	Time        time.Time
-	ComponentId string
-}
 
 type ErrorHandler struct {
-	*log.Logger
-	RecvCh     <-chan Error
+	RecvCh     <-chan messaging.Message
 	FatalErrCh chan<- any
 }
 
-func NewErrorHandler(fatalErrCh chan<- any) (*ErrorHandler, chan<- Error, error) {
+func NewErrorHandler(r *messaging.Router, fatalErrCh chan<- any) (*ErrorHandler, error) {
 
-	f, err := os.Create("errors.log")
+	id, errCh := "error_handler", make(chan messaging.Message, 1024)
+	err := r.RegisterComponent(id, errCh)
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("failed to register component with id %v: %v", id, err)
 	}
-
-	logger := log.New(f, "", 10111)
-	errCh := make(chan Error, 2056)
 
 	return &ErrorHandler{
 		RecvCh:     errCh,
 		FatalErrCh: fatalErrCh,
-		Logger:     logger,
-	}, errCh, nil
+	}, nil
 }
 
 func (h *ErrorHandler) Run(ctx context.Context) {
 
 	select {
 	case <-ctx.Done():
-		h.Logger.Printf("Error handler context is done, exiting")
+		fmt.Print("Error handler context is done, exiting")
 		return
 	case msg := <-h.RecvCh:
-		if msg.Err == nil {
-			h.Logger.Printf("[%+v] %v (id=%v)", msg.Severity, msg.Message, msg.ComponentId)
-			if msg.Severity == Critical {
-				select {
-				case h.FatalErrCh <- true:
-				case <-time.After(5 * time.Second):
-					h.Logger.Printf("Lifecycle manager channel is closed, exiting")
-					h.Logger.Printf("Message: %v", msg.Message)
-					h.Logger.Printf("ComponentId: %v", msg.ComponentId)
-					h.Logger.Printf("Severity: %v", msg.Severity)
-					h.Logger.Printf("ErrorCode: %v", msg.ErrorCode)
-					h.Logger.Printf("Time: %v", msg.Time)
-					h.Logger.Printf("Exiting")
-				}
-				return
-			}
+
+		err, ok := msg.Payload.(messaging.ErrorPayload)
+		if !ok {
+			// stuff
 		}
+
+		fmt.Printf("[%+v] %v (id=%v)", err.Severity, err.Message, err.ComponentId)
+		if err.Severity == messaging.Critical {
+			select {
+			case h.FatalErrCh <- true:
+				// handle error
+			case <-time.After(5 * time.Second):
+				fmt.Printf("Lifecycle manager channel is closed, exiting")
+				fmt.Printf("Message: %v", err.Message)
+				fmt.Printf("ComponentId: %v", err.ComponentId)
+				fmt.Printf("Severity: %v", err.Severity)
+				fmt.Printf("ErrorCode: %v", err.ErrorCode)
+				fmt.Printf("Time: %v", err.Time)
+				fmt.Printf("Exiting")
+			}
+			return
+		}
+
 	}
 }

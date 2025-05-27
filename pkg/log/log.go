@@ -6,19 +6,17 @@ import (
 	"os"
 	"sync"
 
-	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 )
 
 type Logger struct {
-	id      string
-	recvCh  <-chan messaging.Message
-	errorCh chan<- apperrors.Error
+	id     string
+	recvCh <-chan messaging.Message
 	*log.Logger
 }
 
-func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error, clientId [20]byte) (*Logger, error) {
+func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20]byte) (*Logger, error) {
 
 	id, ch := "logger", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
@@ -26,7 +24,7 @@ func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<-
 		return nil, err
 	}
 
-	f, err := os.Create("log-*.txt")
+	f, err := os.Create("log.txt")
 	if err != nil {
 		return nil, err
 	}
@@ -34,10 +32,9 @@ func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<-
 	logger := log.New(f, "", 10111)
 
 	return &Logger{
-		id:      id,
-		recvCh:  ch,
-		Logger:  logger,
-		errorCh: errCh,
+		id:     id,
+		recvCh: ch,
+		Logger: logger,
 	}, nil
 }
 

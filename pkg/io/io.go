@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	apperrors "github.com/agaabrieel/bittorrent-client/pkg/errors"
 	"github.com/agaabrieel/bittorrent-client/pkg/messaging"
 	"github.com/agaabrieel/bittorrent-client/pkg/metainfo"
 	"github.com/google/uuid"
@@ -26,7 +25,7 @@ type IOManager struct {
 	wg           sync.WaitGroup
 }
 
-func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh chan<- apperrors.Error) (*IOManager, error) {
+func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router) (*IOManager, error) {
 
 	id, ch := "io_manager", make(chan messaging.Message, 1024)
 	err := r.RegisterComponent(id, ch)
@@ -38,6 +37,12 @@ func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh cha
 	if err != nil {
 		return nil, fmt.Errorf("file creation failed: %v", err)
 	}
+
+	defer func() {
+		if err != nil {
+			f.Close()
+		}
+	}()
 
 	err = f.Truncate(int64(meta.InfoDict.Length))
 	if err != nil {
@@ -57,7 +62,7 @@ func NewIOManager(meta *metainfo.TorrentMetainfo, r *messaging.Router, errCh cha
 	}, nil
 }
 
-func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
+func (mngr *IOManager) Start(ctx context.Context, wg *sync.WaitGroup) {
 	defer mngr.file.Close()
 	defer wg.Done()
 
@@ -74,20 +79,22 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 				if !exists {
 					mngr.Router.Send(msg.ReplyTo, messaging.Message{
-						MsgId:       uuid.NewString(),
+						Id:          uuid.NewString(),
 						SourceId:    mngr.id,
-						ReplyingTo:  msg.MsgId,
+						ReplyingTo:  msg.Id,
 						PayloadType: messaging.Error,
-						Payload: apperrors.Error{
-							Message:     fmt.Sprintf("unexpected message", msg.PayloadType, msg.ReplyingTo),
-							Severity:    apperrors.Warning,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("unexpected message with payload %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Severity:    messaging.Warning,
 							Time:        time.Now(),
 							ComponentId: mngr.id,
 						},
 						CreatedAt: time.Now(),
 					})
-					continue
+					return
 				}
+
 				delete(mngr.SentMessages, msg.ReplyingTo)
 				mngr.mu.Unlock()
 			}
@@ -95,140 +102,166 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			switch msg.PayloadType {
 			case messaging.PieceSend:
 
-				wg.Add(1)
-				go func() {
+				payload, ok := msg.Payload.(messaging.PieceSendPayload)
+				if !ok {
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:   "type validation failed",
+							ErrorCode: messaging.ErrCodeInvalidPayload,
+							Severity:  messaging.Warning,
+						},
+						CreatedAt: time.Now(),
+					})
+					return
+				}
 
-					defer wg.Done()
+				mngr.mu.Lock()
+				defer mngr.mu.Unlock()
 
-					mngr.mu.Lock()
-					defer mngr.mu.Unlock()
+				offset, err := mngr.file.Seek(int64(payload.Index)*mngr.PieceSize, 0)
+				if err != nil {
 
-					payload, ok := msg.Payload.(messaging.PieceSendPayload)
-					if !ok {
-						mngr.Router.Send("", messaging.Message{
-							SourceId:    mngr.id,
-							PayloadType: messaging.Error,
-							Payload: apperrors.Error{
-								Message:   "type validation failed",
-								ErrorCode: apperrors.ErrCodeInvalidPayload,
-							},
-							CreatedAt: time.Now(),
-						})
-						return
-					}
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("file seek failed: %s", err.Error()),
+							ErrorCode:   messaging.ErrCodeInternalError,
+							Severity:    messaging.Warning,
+							ComponentId: "io_manager",
+						},
+						CreatedAt: time.Now(),
+					})
+					return
+				}
 
-					offset, err := mngr.file.Seek(int64(payload.Index)*mngr.FileSize, 0)
-					if err != nil {
+				writtenBytes := int64(0)
+				payloadSize := int64(len(payload.Data))
+				for writtenBytes < payloadSize {
 
-						mngr.Router.Send("", messaging.Message{
-							SourceId:    mngr.id,
-							PayloadType: messaging.Error,
-							Payload: apperrors.Error{
-								Message:   fmt.Sprintf("file seek failed: %s", err.Error()),
-								ErrorCode: apperrors,
-							},
-							CreatedAt: time.Now(),
-						})
-						return
-					}
+					n, err := mngr.file.WriteAt(payload.Data[writtenBytes:], offset+int64(writtenBytes))
 
-					writtenBytes := int64(0)
-					payloadSize := int64(len(payload.Data))
-					for writtenBytes < payloadSize {
+					if err != nil && err != io.EOF {
 
-						n, err := mngr.file.WriteAt(payload.Data[writtenBytes:], offset+int64(writtenBytes))
-
-						if err != nil && err != io.EOF {
-
-							mngr.Router.Send("", messaging.Message{
-								SourceId:    mngr.id,
-								PayloadType: messaging.Error,
-								Payload: messaging.ErrorPayload{
-									Msg: fmt.Sprintf("file writing failed: %v", err),
-								},
-								CreatedAt: time.Now(),
-							})
-							return
-						}
-						writtenBytes += int64(n)
-					}
-
-					if msg.ReplyTo != "" {
 						mngr.Router.Send(msg.ReplyTo, messaging.Message{
-							MsgId:       uuid.NewString(),
 							SourceId:    mngr.id,
-							ReplyTo:     "",
-							ReplyingTo:  msg.MsgId,
-							PayloadType: messaging.Acknowledged,
-							Payload:     nil,
-							CreatedAt:   time.Now(),
+							ReplyingTo:  msg.Id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("file writing failed: %v", err),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInternalError,
+								ComponentId: "io_manager",
+							},
+							CreatedAt: time.Now(),
 						})
+						return
 					}
+					writtenBytes += int64(n)
+				}
 
-				}()
+				if msg.ReplyTo != "" {
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.Acknowledged,
+						Payload:     nil,
+						CreatedAt:   time.Now(),
+					})
+				}
 
 			case messaging.BlockRequest:
 
-				wg.Add(1)
-				go func() {
+				mngr.mu.RLock()
+				defer mngr.mu.RUnlock()
 
-					defer wg.Done()
-
-					mngr.mu.RLock()
-					defer mngr.mu.RUnlock()
-
-					payload, ok := msg.Payload.(messaging.BlockRequestPayload)
-					if !ok {
-						mngr.Router.Send("", messaging.Message{
-							SourceId:    mngr.id,
-							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Msg: "type validation failed",
-							},
-							CreatedAt: time.Now(),
-						})
-						return
-					}
-
-					buffer := make([]byte, payload.Size)
-
-					offset, err := mngr.file.Seek(int64(payload.Index)*mngr.FileSize+int64(payload.Offset), 0)
-					if err != nil {
-						mngr.Router.Send("", messaging.Message{
-							SourceId:    mngr.id,
-							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Msg: fmt.Sprintf("file seek failed: %v", err),
-							},
-							CreatedAt: time.Now(),
-						})
-						return
-					}
-
-					writtenBytes := int64(0)
-					for writtenBytes < int64(payload.Size) {
-						n, err := mngr.file.ReadAt(buffer[writtenBytes:], offset+int64(writtenBytes))
-						if err != nil && err != io.EOF {
-
-							mngr.Router.Send("", messaging.Message{
-								SourceId:    mngr.id,
-								PayloadType: messaging.Error,
-								Payload: messaging.ErrorPayload{
-									Msg: fmt.Sprintf("file write failed: %v", err),
-								},
-								CreatedAt: time.Now(),
-							})
-							return
-
-						}
-						writtenBytes += int64(n)
-					}
-
+				payload, ok := msg.Payload.(messaging.BlockRequestPayload)
+				if !ok {
 					mngr.Router.Send(msg.ReplyTo, messaging.Message{
-						MsgId:       uuid.NewString(),
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:   "type validation failed",
+							ErrorCode: messaging.ErrCodeInvalidPayload,
+							Severity:  messaging.Warning,
+						},
+						CreatedAt: time.Now(),
+					})
+					return
+				}
+
+				buffer := make([]byte, payload.Size)
+
+				offset, err := mngr.file.Seek(int64(payload.Index)*mngr.PieceSize+int64(payload.Offset), 0)
+				if err != nil {
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("file seek failed: %s", err.Error()),
+							ErrorCode:   messaging.ErrCodeInternalError,
+							Severity:    messaging.Warning,
+							ComponentId: "io_manager",
+						},
+						CreatedAt: time.Now(),
+					})
+					return
+				}
+
+				writtenBytes := int64(0)
+				for writtenBytes < int64(payload.Size) {
+					n, err := mngr.file.ReadAt(buffer[writtenBytes:], offset+int64(writtenBytes))
+					if err != nil && err != io.EOF {
+
+						mngr.Router.Send(msg.ReplyTo, messaging.Message{
+							SourceId:    mngr.id,
+							ReplyingTo:  msg.Id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("file reading failed: %v", err),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInternalError,
+								ComponentId: "io_manager",
+							},
+							CreatedAt: time.Now(),
+						})
+						return
+
+					}
+					writtenBytes += int64(n)
+				}
+
+				if msg.ReplyTo == "" {
+					mngr.Router.Send("error_handler", messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     "message payload requires reply but doesn't contain a ReplyTo id",
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInternalError,
+							ComponentId: "io_manager",
+						},
+						CreatedAt: time.Now(),
+					})
+				} else {
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          uuid.NewString(),
 						SourceId:    mngr.id,
 						ReplyTo:     mngr.id,
-						ReplyingTo:  msg.MsgId,
+						ReplyingTo:  msg.Id,
 						PayloadType: messaging.BlockSend,
 						Payload: messaging.BlockSendPayload{
 							Index:  payload.Index,
@@ -238,9 +271,9 @@ func (mngr *IOManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 						},
 						CreatedAt: time.Now(),
 					})
-
-				}()
+				}
 			}
+
 		case <-ctx.Done():
 			return
 		}
