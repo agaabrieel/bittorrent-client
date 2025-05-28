@@ -31,7 +31,7 @@ type SessionManager struct {
 	Port      int
 	Metainfo  *metainfo.TorrentMetainfo
 	RecvCh    <-chan messaging.Message
-	waitGroup *sync.WaitGroup
+	wg        *sync.WaitGroup
 	mutex     *sync.Mutex
 	ctx       context.Context
 	ctxCancel context.CancelFunc
@@ -64,7 +64,7 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 		Port:      CLIENT_PORT,
 		RecvCh:    ch,
 		mutex:     &sync.Mutex{},
-		waitGroup: &sync.WaitGroup{},
+		wg:        &sync.WaitGroup{},
 		ctx:       ctx,
 		ctxCancel: ctxCancel,
 	}, nil
@@ -104,30 +104,31 @@ func (mngr *SessionManager) Run() {
 		Logger.Panicf("failed to create io manager: %v", err)
 	}
 
-	mngr.waitGroup.Add(1)
+	mngr.wg.Add(1)
 	go ErrorHandler.Run(mngr.ctx)
 
-	mngr.waitGroup.Add(1)
-	go Logger.Run(mngr.ctx, mngr.waitGroup)
+	mngr.wg.Add(1)
+	go Logger.Run(mngr.ctx, mngr.wg)
 
-	mngr.waitGroup.Add(1)
-	go PeerOrchestrator.Run(mngr.ctx, mngr.waitGroup)
+	mngr.wg.Add(1)
+	go PeerOrchestrator.Run(mngr.ctx, mngr.wg)
 
-	mngr.waitGroup.Add(1)
-	go PieceManager.Run(mngr.ctx, mngr.waitGroup)
+	mngr.wg.Add(1)
+	go PieceManager.Run(mngr.ctx, mngr.wg)
 
-	mngr.waitGroup.Add(1)
-	go IOManager.Start(mngr.ctx, mngr.waitGroup)
+	mngr.wg.Add(1)
+	go IOManager.Start(mngr.ctx, mngr.wg)
 
-	mngr.waitGroup.Add(1)
-	go TrackerManager.Run(mngr.ctx, mngr.waitGroup)
+	mngr.wg.Add(1)
+	go TrackerManager.Run(mngr.ctx, mngr.wg)
 
-	defer mngr.waitGroup.Wait()
+	defer mngr.wg.Wait()
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(mngr.Port)))
 	if err != nil {
 		Logger.Panicf("failed to create io manager: %v", err)
 	}
+	defer listener.Close()
 
 	go func() {
 		for {
@@ -162,8 +163,6 @@ func (mngr *SessionManager) Run() {
 	select {
 	case <-fatalErrCh:
 		mngr.ctxCancel()
-		listener.Close()
 	case <-mngr.ctx.Done():
-		listener.Close()
 	}
 }

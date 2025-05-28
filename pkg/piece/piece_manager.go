@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 )
 
+const WORKER_POOL_SIZE int = 10
 const SHA1Size int = 20
 
 type PieceManager struct {
@@ -59,111 +60,123 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	_, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	workersJobsCh := make(chan messaging.Message)
+
+	for range WORKER_POOL_SIZE {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for msg := range workersJobsCh {
+
+				if msg.ReplyingTo != "" {
+
+					mngr.mutex.Lock()
+					exists := mngr.SentMessages[msg.ReplyingTo]
+					if !exists {
+						mngr.Router.Send("error_manager", messaging.Message{
+							Id:          uuid.NewString(),
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+								Severity:    messaging.Warning,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+						continue
+					}
+					delete(mngr.SentMessages, msg.ReplyingTo)
+					mngr.mutex.Unlock()
+				}
+
+				if msg.ReplyTo != "" {
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyTo:     "",
+						ReplyingTo:  "",
+						PayloadType: messaging.Acknowledged,
+						Payload:     nil,
+						CreatedAt:   time.Now(),
+					})
+				}
+
+				switch msg.PayloadType {
+
+				case messaging.BlockRequest:
+					_, ok := msg.Payload.(messaging.BlockRequestPayload)
+					if !ok {
+						mngr.Router.Send("error_manager", messaging.Message{
+							Id:          uuid.NewString(),
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("incorrect payload type: expected BlockRequestPayload, got %v", msg.PayloadType),
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								ComponentId: "piece_manager",
+								Time:        time.Now(),
+								Severity:    messaging.Warning,
+							},
+							CreatedAt: time.Now(),
+						})
+						return
+					}
+
+					mngr.handleBlockRequestMessage(msg)
+
+				case messaging.BlockSend:
+					_, ok := msg.Payload.(messaging.BlockSendPayload)
+					if !ok {
+						mngr.Router.Send("error_manager", messaging.Message{
+							Id:          uuid.NewString(),
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("incorrect payload type: expected BlockSendPayload, got %v", msg.PayloadType),
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								ComponentId: "piece_manager",
+								Time:        time.Now(),
+								Severity:    messaging.Warning,
+							},
+							CreatedAt: time.Now(),
+						})
+						return
+					}
+
+					mngr.handleBlockSendMessage(msg)
+
+				case messaging.NextPieceIndexRequest:
+					_, ok := msg.Payload.(messaging.NextBlockIndexRequestPayload)
+					if !ok {
+						mngr.Router.Send("error_manager", messaging.Message{
+							Id:          uuid.NewString(),
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("incorrect payload type: expected NextBlockIndexRequestPayload, got %v", msg.PayloadType),
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								ComponentId: "piece_manager",
+								Time:        time.Now(),
+								Severity:    messaging.Warning,
+							},
+							CreatedAt: time.Now(),
+						})
+						return
+					}
+					mngr.processNextBlockRequest(msg)
+				}
+			}
+		}()
+	}
+
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
-
-			if msg.ReplyingTo != "" {
-
-				mngr.mutex.Lock()
-				exists := mngr.SentMessages[msg.ReplyingTo]
-				if !exists {
-					mngr.Router.Send("error_manager", messaging.Message{
-						Id:          uuid.NewString(),
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
-							Severity:    messaging.Warning,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-					continue
-				}
-				delete(mngr.SentMessages, msg.ReplyingTo)
-				mngr.mutex.Unlock()
-			}
-
-			if msg.ReplyTo != "" {
-				mngr.Router.Send(msg.ReplyTo, messaging.Message{
-					Id:          uuid.NewString(),
-					SourceId:    mngr.id,
-					ReplyTo:     "",
-					ReplyingTo:  "",
-					PayloadType: messaging.Acknowledged,
-					Payload:     nil,
-					CreatedAt:   time.Now(),
-				})
-			}
-
-			switch msg.PayloadType {
-
-			case messaging.BlockRequest:
-				_, ok := msg.Payload.(messaging.BlockRequestPayload)
-				if !ok {
-					mngr.Router.Send("error_manager", messaging.Message{
-						Id:          uuid.NewString(),
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("incorrect payload type: expected BlockRequestPayload, got %v", msg.PayloadType),
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							ComponentId: "piece_manager",
-							Time:        time.Now(),
-							Severity:    messaging.Warning,
-						},
-						CreatedAt: time.Now(),
-					})
-					return
-				}
-
-				mngr.handleBlockRequestMessage(msg)
-
-			case messaging.BlockSend:
-				_, ok := msg.Payload.(messaging.BlockSendPayload)
-				if !ok {
-					mngr.Router.Send("error_manager", messaging.Message{
-						Id:          uuid.NewString(),
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("incorrect payload type: expected BlockSendPayload, got %v", msg.PayloadType),
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							ComponentId: "piece_manager",
-							Time:        time.Now(),
-							Severity:    messaging.Warning,
-						},
-						CreatedAt: time.Now(),
-					})
-					return
-				}
-
-				mngr.handleBlockSendMessage(msg)
-
-			case messaging.NextPieceIndexRequest:
-				_, ok := msg.Payload.(messaging.NextBlockIndexRequestPayload)
-				if !ok {
-					mngr.Router.Send("error_manager", messaging.Message{
-						Id:          uuid.NewString(),
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("incorrect payload type: expected NextBlockIndexRequestPayload, got %v", msg.PayloadType),
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							ComponentId: "piece_manager",
-							Time:        time.Now(),
-							Severity:    messaging.Warning,
-						},
-						CreatedAt: time.Now(),
-					})
-					return
-				}
-				mngr.processNextBlockRequest(msg)
-			}
-
+			workersJobsCh <- msg
 		case <-ctx.Done():
+			close(workersJobsCh)
 			return
 		}
 	}

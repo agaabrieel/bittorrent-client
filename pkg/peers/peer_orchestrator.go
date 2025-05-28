@@ -12,6 +12,8 @@ import (
 	"github.com/google/uuid"
 )
 
+const WORKER_POOL_SIZE int = 10
+
 type PeerOrchestrator struct {
 	id             string
 	Router         *messaging.Router
@@ -52,201 +54,216 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer ctxCancel()
 	defer wg.Done()
 
+	workersJobsCh := make(chan messaging.Message, 1)
+	for range WORKER_POOL_SIZE {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for msg := range workersJobsCh {
+				if msg.ReplyingTo != "" {
+					mngr.Mutex.Lock()
+					exists := mngr.SentMessages[msg.ReplyingTo]
+					if !exists {
+						mngr.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeUnexpectedMessage,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+						continue
+					}
+					delete(mngr.SentMessages, msg.ReplyingTo)
+					mngr.Mutex.Unlock()
+				}
+
+				if msg.ReplyTo != "" {
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          uuid.NewString(),
+						SourceId:    mngr.id,
+						ReplyTo:     "",
+						ReplyingTo:  "",
+						PayloadType: messaging.Acknowledged,
+						Payload:     nil,
+						CreatedAt:   time.Now(),
+					})
+				}
+
+				switch msg.PayloadType {
+				case messaging.PeersDiscovered:
+
+					payload, ok := msg.Payload.(messaging.PeersDiscoveredPayload)
+					if !ok {
+						mngr.Router.Send(msg.ReplyTo, messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected PeersDiscoveredPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+					}
+
+					for _, addr := range payload.Addrs {
+						peerMngr := NewPeerManager(mngr.Router, nil, addr, wg)
+						go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
+					}
+
+				case messaging.PeerConnected:
+
+					payload, ok := msg.Payload.(messaging.PeerConnectedPayload)
+					if !ok {
+						mngr.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected PeerConnectedPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+					}
+
+					peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr(), wg)
+					go peerMngr.replyToPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
+
+				case messaging.PieceValidated:
+
+					payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
+					if !ok {
+						mngr.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected PieceValidatedPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+					}
+
+					wg.Add(1)
+					go func() {
+						mngr.Mutex.Lock()
+						defer mngr.Mutex.Unlock()
+						defer wg.Done()
+						mngr.Bitfield.Set(uint(payload.Index))
+					}()
+
+				case messaging.PeerBitfield:
+
+					payload, ok := msg.Payload.(messaging.PeerBitfieldPayload)
+					if !ok {
+						mngr.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected PeerBitfieldPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+					}
+
+					mngr.Mutex.Lock()
+					mngr.PeerBitfields[msg.SourceId] = payload.Bitfield
+					mngr.Mutex.Unlock()
+
+				case messaging.PeerBitfieldUpdate:
+
+					payload, ok := msg.Payload.(messaging.PeerBitfieldUpdatePayload)
+					if !ok {
+						mngr.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected PeerBitfieldUpdatePayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+					}
+
+					mngr.Mutex.Lock()
+					mngr.PeerBitfields[msg.SourceId].Set(uint(payload.Index))
+					mngr.Mutex.Unlock()
+
+				case messaging.NextPieceIndexRequest:
+
+					_, ok := msg.Payload.(messaging.NextPieceIndexRequestPayload)
+					if !ok {
+						mngr.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    mngr.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("unexpected payload, expected NextPieceIndexRequestPayload, got %v", msg.PayloadType),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: mngr.id,
+							},
+							CreatedAt: time.Now(),
+						})
+					}
+
+					// PICK NEXT PIECE BASED ON RARITY
+					// mockup
+					index := 10
+					// MOCKUP
+
+					msgId := uuid.NewString()
+					mngr.SentMessages[msgId] = true
+
+					mngr.Router.Send(msg.ReplyTo, messaging.Message{
+						Id:          msgId,
+						SourceId:    mngr.id,
+						ReplyTo:     mngr.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.NextPieceIndexSend,
+						Payload: messaging.NextPieceIndexSendPayload{
+							Index: index,
+						},
+						CreatedAt: time.Now(),
+					})
+
+				}
+			}
+		}()
+	}
+
 	for {
 		select {
 		case msg := <-mngr.RecvCh:
-
-			if msg.ReplyingTo != "" {
-				mngr.Mutex.Lock()
-				exists := mngr.SentMessages[msg.ReplyingTo]
-				if !exists {
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
-							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeUnexpectedMessage,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-					continue
-				}
-				delete(mngr.SentMessages, msg.ReplyingTo)
-				mngr.Mutex.Unlock()
-			}
-
-			if msg.ReplyTo != "" {
-				mngr.Router.Send(msg.ReplyTo, messaging.Message{
-					Id:          uuid.NewString(),
-					SourceId:    mngr.id,
-					ReplyTo:     "",
-					ReplyingTo:  "",
-					PayloadType: messaging.Acknowledged,
-					Payload:     nil,
-					CreatedAt:   time.Now(),
-				})
-			}
-
-			switch msg.PayloadType {
-			case messaging.PeersDiscovered:
-
-				payload, ok := msg.Payload.(messaging.PeersDiscoveredPayload)
-				if !ok {
-					mngr.Router.Send(msg.ReplyTo, messaging.Message{
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected payload, expected PeersDiscoveredPayload, got %v", msg.PayloadType),
-							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-				}
-
-				for _, addr := range payload.Addrs {
-					peerMngr := NewPeerManager(mngr.Router, nil, addr, wg)
-					go peerMngr.startPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
-				}
-
-			case messaging.PeerConnected:
-
-				payload, ok := msg.Payload.(messaging.PeerConnectedPayload)
-				if !ok {
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected payload, expected PeerConnectedPayload, got %v", msg.PayloadType),
-							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-				}
-
-				peerMngr := NewPeerManager(mngr.Router, payload.Conn, payload.Conn.RemoteAddr(), wg)
-				go peerMngr.replyToPeerHandshake(childCtx, mngr.clientInfohash, mngr.clientId)
-
-			case messaging.PieceValidated:
-
-				payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
-				if !ok {
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected payload, expected PieceValidatedPayload, got %v", msg.PayloadType),
-							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-				}
-
-				wg.Add(1)
-				go func() {
-					mngr.Mutex.Lock()
-					defer mngr.Mutex.Unlock()
-					defer wg.Done()
-					mngr.Bitfield.Set(uint(payload.Index))
-				}()
-
-			case messaging.PeerBitfield:
-
-				payload, ok := msg.Payload.(messaging.PeerBitfieldPayload)
-				if !ok {
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected payload, expected PeerBitfieldPayload, got %v", msg.PayloadType),
-							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-				}
-
-				mngr.Mutex.Lock()
-				mngr.PeerBitfields[msg.SourceId] = payload.Bitfield
-				mngr.Mutex.Unlock()
-
-			case messaging.PeerBitfieldUpdate:
-
-				payload, ok := msg.Payload.(messaging.PeerBitfieldUpdatePayload)
-				if !ok {
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected payload, expected PeerBitfieldUpdatePayload, got %v", msg.PayloadType),
-							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-				}
-
-				mngr.Mutex.Lock()
-				mngr.PeerBitfields[msg.SourceId].Set(uint(payload.Index))
-				mngr.Mutex.Unlock()
-
-			case messaging.NextPieceIndexRequest:
-
-				_, ok := msg.Payload.(messaging.NextPieceIndexRequestPayload)
-				if !ok {
-					mngr.Router.Send("peer_orchestrator", messaging.Message{
-						SourceId:    mngr.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     fmt.Sprintf("unexpected payload, expected NextPieceIndexRequestPayload, got %v", msg.PayloadType),
-							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
-							Time:        time.Now(),
-							ComponentId: mngr.id,
-						},
-						CreatedAt: time.Now(),
-					})
-				}
-
-				// PICK NEXT PIECE BASED ON RARITY
-				// mockup
-				index := 10
-				// MOCKUP
-
-				msgId := uuid.NewString()
-				mngr.SentMessages[msgId] = true
-
-				mngr.Router.Send(msg.ReplyTo, messaging.Message{
-					Id:          msgId,
-					SourceId:    mngr.id,
-					ReplyTo:     mngr.id,
-					ReplyingTo:  msg.Id,
-					PayloadType: messaging.NextPieceIndexSend,
-					Payload: messaging.NextPieceIndexSendPayload{
-						Index: index,
-					},
-					CreatedAt: time.Now(),
-				})
-
-			}
-
+			workersJobsCh <- msg
 		case <-ctx.Done():
+			close(workersJobsCh)
+			mngr.Shutdown()
 			return // should add logging here
 		}
 	}
+}
+
+func (mngr *PeerOrchestrator) Shutdown() {
+	// ? maybe not needed???
 }
