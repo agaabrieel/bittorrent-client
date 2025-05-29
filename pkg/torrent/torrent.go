@@ -70,38 +70,20 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 	}, nil
 }
 
-func (mngr *SessionManager) Run() {
+func (mngr *SessionManager) Start() {
 
 	fatalErrCh := make(chan any, 1)
 
 	ErrorHandler, err := errors.NewErrorHandler(mngr.Router, fatalErrCh)
 	if err != nil {
+		print("failed to create error handler instance")
 		panic(err)
 	}
 
 	Logger, err := logger.NewLogger(mngr.Metainfo, mngr.Router, mngr.ClientId)
 	if err != nil {
+		print("failed to create logger instance")
 		panic(err)
-	}
-
-	TrackerManager, err := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
-	if err != nil {
-		Logger.Panicf("failed to create tracker manager: %v", err)
-	}
-
-	PeerOrchestrator, err := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, mngr.ClientId)
-	if err != nil {
-		Logger.Panicf("failed to create peer orchestrator: %v", err)
-	}
-
-	PieceManager, err := piece.NewPieceManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
-	if err != nil {
-		Logger.Panicf("failed to create piece manager: %v", err)
-	}
-
-	IOManager, err := io.NewIOManager(mngr.Metainfo, mngr.Router)
-	if err != nil {
-		Logger.Panicf("failed to create io manager: %v", err)
 	}
 
 	mngr.wg.Add(1)
@@ -109,6 +91,32 @@ func (mngr *SessionManager) Run() {
 
 	mngr.wg.Add(1)
 	go Logger.Run(mngr.ctx, mngr.wg)
+
+	Logger.Print("Creating Tracker Manager instance")
+	TrackerManager, err := tracker.NewTrackerManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	if err != nil {
+		Logger.Panicf("failed to create tracker manager: %v", err)
+	}
+
+	Logger.Print("Generating Peer Orchestrator instance")
+	PeerOrchestrator, err := peer.NewPeerOrchestrator(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	if err != nil {
+		Logger.Panicf("failed to create peer orchestrator: %v", err)
+	}
+
+	Logger.Print("Generating Piece Manager instance")
+	PieceManager, err := piece.NewPieceManager(mngr.Metainfo, mngr.Router, mngr.ClientId)
+	if err != nil {
+		Logger.Panicf("failed to create piece manager: %v", err)
+	}
+
+	Logger.Print("Generating IO Manager instance")
+	IOManager, err := io.NewIOManager(mngr.Metainfo, mngr.Router)
+	if err != nil {
+		Logger.Panicf("failed to create io manager: %v", err)
+	}
+
+	Logger.Print("Initializing components main loop")
 
 	mngr.wg.Add(1)
 	go PeerOrchestrator.Run(mngr.ctx, mngr.wg)
@@ -123,6 +131,8 @@ func (mngr *SessionManager) Run() {
 	go TrackerManager.Run(mngr.ctx, mngr.wg)
 
 	defer mngr.wg.Wait()
+
+	Logger.Print("Initializing listener loop")
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(mngr.Port)))
 	if err != nil {

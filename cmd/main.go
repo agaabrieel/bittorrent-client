@@ -1,8 +1,6 @@
 package main
 
 import (
-	"log"
-	"net/http"
 	_ "net/http/pprof"
 	"os"
 
@@ -12,15 +10,11 @@ import (
 
 func main() {
 
-	go func() {
-		log.Println(http.ListenAndServe("localhost:6060", nil))
-	}()
-
 	Router := messaging.NewRouter()
 	TorrentSession, err := session.NewSessionManager(os.Args[1], Router)
 	if err != nil {
+		print(err.Error() + "\n")
 		os.Exit(1)
 	}
-
-	TorrentSession.Run()
+	TorrentSession.Start()
 }
