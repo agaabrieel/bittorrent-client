@@ -72,9 +72,9 @@ func NewSessionManager(filepath string, r *messaging.Router) (*SessionManager, e
 
 func (mngr *SessionManager) Start() {
 
-	fatalErrCh := make(chan any, 1)
+	shutdownCh := make(chan any, 1)
 
-	ErrorHandler, err := errors.NewErrorHandler(mngr.Router, fatalErrCh)
+	ErrorHandler, err := errors.NewErrorHandler(mngr.Router, shutdownCh)
 	if err != nil {
 		print("failed to create error handler instance")
 		panic(err)
@@ -130,8 +130,6 @@ func (mngr *SessionManager) Start() {
 	mngr.wg.Add(1)
 	go TrackerManager.Run(mngr.ctx, mngr.wg)
 
-	defer mngr.wg.Wait()
-
 	Logger.Print("Initializing listener loop")
 
 	listener, err := net.Listen("tcp", net.JoinHostPort("localhost", strconv.Itoa(mngr.Port)))
@@ -171,8 +169,14 @@ func (mngr *SessionManager) Start() {
 	}()
 
 	select {
-	case <-fatalErrCh:
-		mngr.ctxCancel()
+	case <-shutdownCh:
+		mngr.Shutdown()
 	case <-mngr.ctx.Done():
+		mngr.Shutdown()
 	}
+}
+
+func (mngr *SessionManager) Shutdown() {
+	mngr.ctxCancel()
+	mngr.wg.Wait()
 }

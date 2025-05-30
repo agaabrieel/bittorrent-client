@@ -57,9 +57,6 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	defer mngr.PieceCache.Cleanup()
 
-	_, cancel := context.WithCancel(ctx)
-	defer cancel()
-
 	workersJobsCh := make(chan messaging.Message)
 
 	for range WORKER_POOL_SIZE {
@@ -95,10 +92,8 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 					mngr.Router.Send(msg.ReplyTo, messaging.Message{
 						Id:          uuid.NewString(),
 						SourceId:    mngr.id,
-						ReplyTo:     "",
-						ReplyingTo:  "",
+						ReplyingTo:  msg.Id,
 						PayloadType: messaging.Acknowledged,
-						Payload:     nil,
 						CreatedAt:   time.Now(),
 					})
 				}
@@ -177,6 +172,7 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 			workersJobsCh <- msg
 		case <-ctx.Done():
 			close(workersJobsCh)
+			mngr.PieceCache.Cleanup()
 			return
 		}
 	}

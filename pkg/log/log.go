@@ -41,14 +41,12 @@ func NewLogger(meta *metainfo.TorrentMetainfo, r *messaging.Router, clientId [20
 func (l *Logger) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 	defer wg.Done()
-	_, ctxCancel := context.WithCancel(ctx)
 
 	for {
 		select {
 		case msg := <-l.recvCh:
 			l.Printf("Message of type %v sent by %s at %v, expected reply to %s. Payload is: %+v", msg.PayloadType, msg.SourceId, msg.CreatedAt, msg.ReplyTo, msg.Payload)
 		case <-ctx.Done():
-			ctxCancel()
 			return
 		}
 	}

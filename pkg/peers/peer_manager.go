@@ -552,7 +552,6 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 							Id:          msgId,
 							SourceId:    p.id,
 							ReplyTo:     p.id,
-							ReplyingTo:  "",
 							PayloadType: messaging.BlockSend,
 							Payload: messaging.BlockSendPayload{
 								Index:  binary.BigEndian.Uint32(msg.data[5:9]),
@@ -580,7 +579,9 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 			case msg := <-p.RecvCh:
 
-				if msg.ReplyingTo != "" {
+				if msg.ReplyingTo == "" {
+					continue
+				} else {
 					p.mu.Lock()
 					exists := p.SentMessages[msg.ReplyingTo]
 					if !exists {
@@ -597,6 +598,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 							},
 							CreatedAt: time.Now(),
 						})
+						p.mu.Unlock()
 						continue
 					}
 					delete(p.SentMessages, msg.ReplyingTo)
@@ -724,7 +726,6 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 	select {
 	case <-ctx.Done():
-		ctxCancel()
 		return
 	default:
 

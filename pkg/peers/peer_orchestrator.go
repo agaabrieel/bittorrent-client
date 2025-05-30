@@ -258,12 +258,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 			workersJobsCh <- msg
 		case <-ctx.Done():
 			close(workersJobsCh)
-			mngr.Shutdown()
 			return // should add logging here
 		}
 	}
-}
-
-func (mngr *PeerOrchestrator) Shutdown() {
-	// ? maybe not needed???
 }
