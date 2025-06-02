@@ -58,7 +58,6 @@ func (mngr *PieceManager) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer mngr.PieceCache.Cleanup()
 
 	workersJobsCh := make(chan messaging.Message)
-
 	for range WORKER_POOL_SIZE {
 		wg.Add(1)
 		go func() {

@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"sync"
@@ -84,38 +85,49 @@ func (r *Router) Broadcast(msg Message) {
 	}
 }
 
-func (r *Router) FlushMessageBuffer() {
-
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+func (r *Router) RunFlushMessageBufferLoop(ctx context.Context) {
 
 	deliveredMessages := make([]Message, 1024)
+	timer := time.NewTimer(15 * time.Second)
 
-	for msg, id := range r.MessageBuffer {
-
-		if id == "*" {
-			r.Broadcast(msg)
-			continue
-		}
-
+	for {
 		select {
-		case r.Registry[id] <- msg:
-			deliveredMessages = append(deliveredMessages, msg)
-		default:
-			r.log(Message{
-				SourceId:    "router",
-				PayloadType: Error,
-				Payload: ErrorPayload{
-					Message:  "Channel is blocked. Adding message to message buffer for retries.",
-					Severity: Warning,
-				},
-				CreatedAt: time.Now(),
-			})
-		}
-	}
+		case <-ctx.Done():
+			return
+		case <-timer.C:
 
-	for _, msg := range deliveredMessages {
-		delete(r.MessageBuffer, msg)
+			r.mu.RLock()
+			defer r.mu.RUnlock()
+
+			for msg, id := range r.MessageBuffer {
+
+				if id == "*" {
+					r.Broadcast(msg)
+					continue
+				}
+
+				select {
+				case r.Registry[id] <- msg:
+					deliveredMessages = append(deliveredMessages, msg)
+				default:
+					r.log(Message{
+						SourceId:    "router",
+						PayloadType: Error,
+						Payload: ErrorPayload{
+							Message:  "Channel is blocked. Adding message to message buffer for retries.",
+							Severity: Warning,
+						},
+						CreatedAt: time.Now(),
+					})
+				}
+			}
+
+			for _, msg := range deliveredMessages {
+				delete(r.MessageBuffer, msg)
+			}
+			deliveredMessages = deliveredMessages[:0]
+			timer.Reset(15 * time.Second)
+		}
 	}
 }
 

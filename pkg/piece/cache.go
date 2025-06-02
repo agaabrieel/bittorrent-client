@@ -11,7 +11,7 @@ import (
 )
 
 const BLOCK_SIZE = 16 * 1024                    // 16KiB
-const BLOCK_BITFIELD_SIZE = 2 * 1024            // BLOCK_SIZE / 8 = 2KiB
+const BLOCK_BITFIELD_SIZE = 2 * 1024            // 2KiB = BLOCK_SIZE / 8
 const PIECE_BUFFER_MAX_SIZE = 512 * 1024 * 1024 // 512 MiB
 
 type BlockStatus int

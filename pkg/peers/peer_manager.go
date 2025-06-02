@@ -2,6 +2,7 @@ package peer
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -16,6 +17,13 @@ import (
 )
 
 const HANDSHAKE_SIZE int = 68
+
+type RequestedBlockStatus int
+
+const (
+	Pending RequestedBlockStatus = iota
+	Complete
+)
 
 type PeerMessageType uint8
 
@@ -40,25 +48,26 @@ type PeerMessage struct {
 }
 
 type PeerManager struct {
-	id              string
-	Router          *messaging.Router
-	PeerId          [20]byte
-	PeerConn        net.Conn
-	PeerAddr        net.Addr
-	PeerBitfield    *bitset.BitSet
-	OurBitfield     *bitset.BitSet
-	IsInterested    bool
-	IsInteresting   bool
-	IsChoked        bool
-	IsChoking       bool
-	PiecesRequested []PeerMessage
-	LastActive      time.Time
-	LastMessage     PeerMessage
-	SentMessages    map[string]bool
-	wg              *sync.WaitGroup
-	mu              *sync.RWMutex
-	RecvCh          <-chan messaging.Message
-	BlocksToRequest chan messaging.BlockRequestPayload
+	id                 string
+	Router             *messaging.Router
+	PeerId             [20]byte
+	PeerConn           net.Conn
+	PeerAddr           net.Addr
+	PeerBitfield       *bitset.BitSet
+	OurBitfield        *bitset.BitSet
+	IsInterested       bool
+	IsInteresting      bool
+	IsChoked           bool
+	IsChoking          bool
+	LastActive         time.Time
+	LastMessage        PeerMessage
+	SentMessages       map[string]bool
+	wg                 *sync.WaitGroup
+	mu                 *sync.RWMutex
+	RecvCh             <-chan messaging.Message
+	CurrentPieceIndex  int
+	CurrentBlockStatus RequestedBlockStatus
+	BlockPipeline      *list.List
 }
 
 func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.WaitGroup) *PeerManager {
@@ -68,13 +77,13 @@ func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.
 	r.RegisterComponent(id, ch)
 
 	return &PeerManager{
-		id:              id,
-		PeerConn:        conn,
-		PeerAddr:        addr,
-		mu:              &sync.RWMutex{},
-		wg:              wg,
-		RecvCh:          ch,
-		BlocksToRequest: make(chan messaging.BlockRequestPayload, 1024),
+		id:            id,
+		PeerConn:      conn,
+		PeerAddr:      addr,
+		mu:            &sync.RWMutex{},
+		wg:            wg,
+		RecvCh:        ch,
+		BlockPipeline: list.New(),
 	}
 }
 
@@ -426,285 +435,18 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 	peerConnSendCh <- bitfieldMsg
 
-	// PEER MESSAGE LISTENER
+	// PEER MESSAGE LISTENER WORKER
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		for {
-			select {
-			case <-childCtx.Done():
-				return
-
-			case msg := <-peerConnRecvCh:
-				p.wg.Add(1)
-				go func() {
-
-					p.mu.Lock()
-					defer p.mu.Unlock()
-					defer p.wg.Done()
-
-					p.LastMessage = msg
-					p.LastActive = time.Now()
-
-					switch msg.messageType {
-
-					// First 4 cases simply update the internal peer state
-					case Choke:
-						p.IsChoking = true
-
-					case Unchoke:
-						p.IsChoking = false
-
-					case NotInterested:
-						p.IsInterested = false
-
-					case Interested:
-						p.IsInterested = true
-
-					case Bitfield:
-
-						bs := make([]uint64, len(msg.data)/8)
-						for i := range len(bs) {
-							bs[i] = binary.BigEndian.Uint64(msg.data[0+i*8 : 8+i*8])
-						}
-
-						p.PeerBitfield = bitset.From(bs)
-						wantedPieces := p.PeerBitfield.Difference(p.OurBitfield)
-
-						if wantedPieces.Any() {
-							if !p.IsInteresting {
-								peerConnSendCh <- generateNoPayloadMsg(Interested)
-								p.IsInteresting = true
-							}
-						} else if p.IsInteresting {
-							peerConnSendCh <- generateNoPayloadMsg(NotInterested)
-							p.IsInteresting = false
-						}
-
-						msgId := uuid.NewString()
-						p.SentMessages[msgId] = true
-						p.Router.Send("peer_orchestrator", messaging.Message{
-							Id:          msgId,
-							SourceId:    p.id,
-							ReplyTo:     p.id,
-							PayloadType: messaging.PeerBitfield,
-							Payload: messaging.PeerBitfieldPayload{
-								Bitfield: p.PeerBitfield,
-							},
-							CreatedAt: time.Now(),
-						})
-
-					case Have:
-
-						pieceIndex := binary.BigEndian.Uint32(msg.data[5:])
-						p.PeerBitfield.Set(uint(pieceIndex))
-
-						wantedPieces := p.PeerBitfield.Difference(p.OurBitfield)
-
-						if wantedPieces.Any() {
-							if !p.IsInteresting {
-								peerConnSendCh <- generateNoPayloadMsg(Interested)
-								p.IsInteresting = true
-							}
-						} else if p.IsInteresting {
-							peerConnSendCh <- generateNoPayloadMsg(NotInterested)
-							p.IsInteresting = false
-						}
-
-						msgId := uuid.NewString()
-						p.SentMessages[msgId] = true
-						p.Router.Send("peer_orchestrator", messaging.Message{
-							Id:          msgId,
-							SourceId:    p.id,
-							ReplyTo:     p.id,
-							PayloadType: messaging.PeerBitfieldUpdate,
-							Payload: messaging.PeerBitfieldUpdatePayload{
-								Index: int(pieceIndex),
-							},
-							CreatedAt: time.Now(),
-						})
-
-					case Request:
-
-						msgId := uuid.NewString()
-						p.SentMessages[msgId] = true
-
-						p.Router.Send("piece_manager", messaging.Message{
-							Id:          msgId,
-							SourceId:    p.id,
-							ReplyTo:     p.id,
-							ReplyingTo:  "",
-							PayloadType: messaging.BlockRequest,
-							Payload: messaging.BlockRequestPayload{
-								Index:  binary.BigEndian.Uint32(msg.data[5:9]),
-								Offset: binary.BigEndian.Uint32(msg.data[9:13]),
-								Size:   binary.BigEndian.Uint32(msg.data[13:17]),
-							},
-							CreatedAt: time.Now(),
-						})
-
-					case Piece:
-
-						msgId := uuid.NewString()
-						p.SentMessages[msgId] = true
-
-						p.Router.Send("piece_manager", messaging.Message{
-							Id:          msgId,
-							SourceId:    p.id,
-							ReplyTo:     p.id,
-							PayloadType: messaging.BlockSend,
-							Payload: messaging.BlockSendPayload{
-								Index:  binary.BigEndian.Uint32(msg.data[5:9]),
-								Offset: binary.BigEndian.Uint32(msg.data[9:13]),
-								Size:   uint32(len(msg.data[13:])),
-								Data:   msg.data[13:],
-							},
-							CreatedAt: time.Now(),
-						})
-					}
-				}()
-			}
-		}
+		peerListener(childCtx, p, peerConnRecvCh, peerConnSendCh)
 	}()
 
 	// ROUTER LISTENING LOOP
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		for {
-			select {
-			case <-childCtx.Done():
-				// LOG STUFF
-				return
-
-			case msg := <-p.RecvCh:
-
-				if msg.ReplyingTo == "" {
-					continue
-				} else {
-					p.mu.Lock()
-					exists := p.SentMessages[msg.ReplyingTo]
-					if !exists {
-						p.Router.Send("peer_orchestrator", messaging.Message{
-							SourceId:    p.id,
-							ReplyingTo:  msg.Id,
-							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
-								Severity:    messaging.Warning,
-								ErrorCode:   messaging.ErrCodeUnexpectedMessage,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							},
-							CreatedAt: time.Now(),
-						})
-						p.mu.Unlock()
-						continue
-					}
-					delete(p.SentMessages, msg.ReplyingTo)
-					p.mu.Unlock()
-				}
-
-				if msg.ReplyTo != "" {
-					p.Router.Send(msg.ReplyTo, messaging.Message{
-						Id:          uuid.NewString(),
-						SourceId:    p.id,
-						ReplyingTo:  msg.Id,
-						PayloadType: messaging.Acknowledged,
-						Payload:     nil,
-						CreatedAt:   time.Now(),
-					})
-				}
-
-				switch msg.PayloadType {
-				case messaging.BlockSend:
-
-					payload, ok := msg.Payload.(messaging.BlockSendPayload)
-					if !ok {
-						p.Router.Send("peer_orchestrator", messaging.Message{
-							SourceId:    p.id,
-							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Message:     fmt.Sprintf("unexpected payload, expected BlockSendPayload, got %v", msg.PayloadType),
-								Severity:    messaging.Warning,
-								ErrorCode:   messaging.ErrCodeInvalidPayload,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							},
-							CreatedAt: time.Now(),
-						})
-						return
-					}
-
-					if p.IsInterested && !p.IsChoking {
-						peerConnSendCh <- generatePieceMsg(payload.Index, payload.Offset, payload.Data)
-					} else {
-
-						p.Router.Send("peer_orchestrator", messaging.Message{
-							SourceId:    p.id,
-							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Message:     "peer is not interested or choking",
-								Severity:    messaging.Warning,
-								ErrorCode:   messaging.ErrCodeInvalidPayload,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							},
-							CreatedAt: time.Now(),
-						})
-
-					}
-
-				case messaging.PieceValidated:
-
-					payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
-					if !ok {
-						p.Router.Send("peer_orchestrator", messaging.Message{
-							SourceId:    p.id,
-							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Message:     fmt.Sprintf("unexpected payload, expected PieceValidatedPayload, got %v", msg.PayloadType),
-								Severity:    messaging.Warning,
-								ErrorCode:   messaging.ErrCodeInvalidPayload,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							},
-							CreatedAt: time.Now(),
-						})
-					}
-
-					p.mu.Lock()
-					p.OurBitfield.Set(uint(payload.Index))
-					peerConnSendCh <- generateHaveMsg(payload.Index)
-					p.mu.Unlock()
-
-				case messaging.NextBlockIndexSend:
-
-					payload, ok := msg.Payload.(messaging.NextBlockIndexSendPayload)
-					if !ok {
-						p.Router.Send("peer_orchestrator", messaging.Message{
-							SourceId:    p.id,
-							PayloadType: messaging.Error,
-							Payload: messaging.ErrorPayload{
-								Message:     fmt.Sprintf("unexpected payload, expected NextBlockIndexSendPayload, got %v", msg.PayloadType),
-								Severity:    messaging.Warning,
-								ErrorCode:   messaging.ErrCodeInvalidPayload,
-								Time:        time.Now(),
-								ComponentId: p.id,
-							},
-							CreatedAt: time.Now(),
-						})
-					}
-
-					p.BlocksToRequest <- messaging.BlockRequestPayload{
-						Index:  uint32(payload.PieceIndex),
-						Offset: uint32(payload.Offset),
-						Size:   uint32(payload.Size),
-					}
-
-				}
-			}
-		}
+		routerListener(childCtx, p, peerConnSendCh)
 	}()
 
 	// PIECE REQUEST LOOP
@@ -716,7 +458,7 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 			case <-childCtx.Done():
 				// stuff
 				return
-			case block := <-p.BlocksToRequest:
+			case block := <-p.BlockPipeline:
 				if p.IsInteresting && !p.IsChoking {
 					peerConnSendCh <- generateRequestMsg(block.Index, block.Offset, block.Size)
 				}
@@ -906,6 +648,302 @@ func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 					return
 				}
 			}
+		}
+	}
+}
+
+func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- []byte) {
+	for {
+		select {
+		case <-ctx.Done():
+			// LOG STUFF
+			return
+
+		case msg := <-p.RecvCh:
+
+			p.mu.RLock()
+
+			if msg.ReplyingTo == "" {
+				continue
+			} else {
+				exists := p.SentMessages[msg.ReplyingTo]
+				if !exists {
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						ReplyingTo:  msg.Id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("unexpected message with type %v replying to %s", msg.PayloadType, msg.ReplyingTo),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeUnexpectedMessage,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+					continue
+				}
+				p.mu.RUnlock()
+				p.mu.Lock()
+				delete(p.SentMessages, msg.ReplyingTo)
+				p.mu.Unlock()
+				p.mu.RLock()
+			}
+
+			if msg.ReplyTo != "" {
+				p.Router.Send(msg.ReplyTo, messaging.Message{
+					Id:          uuid.NewString(),
+					SourceId:    p.id,
+					ReplyingTo:  msg.Id,
+					PayloadType: messaging.Acknowledged,
+					Payload:     nil,
+					CreatedAt:   time.Now(),
+				})
+			}
+
+			switch msg.PayloadType {
+			case messaging.BlockSend:
+
+				payload, ok := msg.Payload.(messaging.BlockSendPayload)
+				if !ok {
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("unexpected payload, expected BlockSendPayload, got %v", msg.PayloadType),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+					continue
+				}
+
+				if p.IsInterested && !p.IsChoking {
+					peerConnSendCh <- generatePieceMsg(payload.Index, payload.Offset, payload.Data)
+				} else {
+
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     "peer is not interested or choking",
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+
+				}
+
+			case messaging.PieceValidated:
+
+				payload, ok := msg.Payload.(messaging.PieceValidatedPayload)
+				if !ok {
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("unexpected payload, expected PieceValidatedPayload, got %v", msg.PayloadType),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+				}
+
+				peerConnSendCh <- generateHaveMsg(payload.Index)
+
+				p.mu.RUnlock()
+				p.mu.Lock()
+				p.OurBitfield.Set(uint(payload.Index))
+				p.mu.Unlock()
+				p.mu.Lock()
+
+			case messaging.NextBlockIndexSend:
+
+				payload, ok := msg.Payload.(messaging.NextBlockIndexSendPayload)
+				if !ok {
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("unexpected payload, expected NextBlockIndexSendPayload, got %v", msg.PayloadType),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+				}
+
+				select {
+				case p.BlockPipeline <- messaging.BlockRequestPayload{
+					Index:  uint32(payload.PieceIndex),
+					Offset: uint32(payload.Offset),
+					Size:   uint32(payload.Size),
+				}:
+					continue
+				default:
+					p.Router.Send(msg.ReplyTo, messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     "Block pipeline is full, dropping message",
+							Severity:    messaging.Warning,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+					})
+				}
+
+			}
+
+			p.mu.RUnlock()
+		}
+	}
+}
+
+func peerListener(ctx context.Context, p *PeerManager, peerConnRecvCh <-chan PeerMessage, peerConnSendCh chan<- []byte) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg, ok := <-peerConnRecvCh:
+
+			if !ok {
+				// should log stuff here
+				return
+			}
+
+			p.mu.Lock()
+
+			p.LastMessage = msg
+			p.LastActive = time.Now()
+			switch msg.messageType {
+
+			// First 4 cases simply update the internal peer state
+			case Choke:
+				p.IsChoking = true
+
+			case Unchoke:
+				p.IsChoking = false
+
+			case NotInterested:
+				p.IsInterested = false
+
+			case Interested:
+				p.IsInterested = true
+
+			case Bitfield:
+
+				bs := make([]uint64, len(msg.data)/8)
+				for i := range len(bs) {
+					bs[i] = binary.BigEndian.Uint64(msg.data[0+i*8 : 8+i*8])
+				}
+
+				p.PeerBitfield = bitset.From(bs)
+				wantedPieces := p.PeerBitfield.Difference(p.OurBitfield)
+
+				if wantedPieces.Any() {
+					if !p.IsInteresting {
+						peerConnSendCh <- generateNoPayloadMsg(Interested)
+						p.IsInteresting = true
+					}
+				} else if p.IsInteresting {
+					peerConnSendCh <- generateNoPayloadMsg(NotInterested)
+					p.IsInteresting = false
+				}
+
+				msgId := uuid.NewString()
+				p.SentMessages[msgId] = true
+				p.Router.Send("peer_orchestrator", messaging.Message{
+					Id:          msgId,
+					SourceId:    p.id,
+					ReplyTo:     p.id,
+					PayloadType: messaging.PeerBitfield,
+					Payload: messaging.PeerBitfieldPayload{
+						Bitfield: p.PeerBitfield,
+					},
+					CreatedAt: time.Now(),
+				})
+
+			case Have:
+
+				pieceIndex := binary.BigEndian.Uint32(msg.data[5:])
+				p.PeerBitfield.Set(uint(pieceIndex))
+
+				wantedPieces := p.PeerBitfield.Difference(p.OurBitfield)
+
+				if wantedPieces.Any() {
+					if !p.IsInteresting {
+						peerConnSendCh <- generateNoPayloadMsg(Interested)
+						p.IsInteresting = true
+					}
+				} else if p.IsInteresting {
+					peerConnSendCh <- generateNoPayloadMsg(NotInterested)
+					p.IsInteresting = false
+				}
+
+				msgId := uuid.NewString()
+				p.SentMessages[msgId] = true
+				p.Router.Send("peer_orchestrator", messaging.Message{
+					Id:          msgId,
+					SourceId:    p.id,
+					ReplyTo:     p.id,
+					PayloadType: messaging.PeerBitfieldUpdate,
+					Payload: messaging.PeerBitfieldUpdatePayload{
+						Index: int(pieceIndex),
+					},
+					CreatedAt: time.Now(),
+				})
+
+			case Request:
+
+				msgId := uuid.NewString()
+				p.SentMessages[msgId] = true
+
+				p.Router.Send("piece_manager", messaging.Message{
+					Id:          msgId,
+					SourceId:    p.id,
+					ReplyTo:     p.id,
+					ReplyingTo:  "",
+					PayloadType: messaging.BlockRequest,
+					Payload: messaging.BlockRequestPayload{
+						Index:  binary.BigEndian.Uint32(msg.data[5:9]),
+						Offset: binary.BigEndian.Uint32(msg.data[9:13]),
+						Size:   binary.BigEndian.Uint32(msg.data[13:17]),
+					},
+					CreatedAt: time.Now(),
+				})
+
+			case Piece:
+
+				msgId := uuid.NewString()
+				p.SentMessages[msgId] = true
+
+				p.Router.Send("piece_manager", messaging.Message{
+					Id:          msgId,
+					SourceId:    p.id,
+					ReplyTo:     p.id,
+					PayloadType: messaging.BlockSend,
+					Payload: messaging.BlockSendPayload{
+						Index:  binary.BigEndian.Uint32(msg.data[5:9]),
+						Offset: binary.BigEndian.Uint32(msg.data[9:13]),
+						Size:   uint32(len(msg.data[13:])),
+						Data:   msg.data[13:],
+					},
+					CreatedAt: time.Now(),
+				})
+			}
+			p.mu.Unlock()
 		}
 	}
 }
