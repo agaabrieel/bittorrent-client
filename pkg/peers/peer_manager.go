@@ -16,7 +16,15 @@ import (
 	"github.com/google/uuid"
 )
 
+const BLOCK_PIPELINE_SIZE int = 5
 const HANDSHAKE_SIZE int = 68
+
+type RequestedPieceStatus int
+
+const (
+	PiecePending RequestedPieceStatus = iota
+	PieceComplete
+)
 
 type RequestedBlockStatus int
 
@@ -66,6 +74,8 @@ type PeerManager struct {
 	mu                 *sync.RWMutex
 	RecvCh             <-chan messaging.Message
 	CurrentPieceIndex  int
+	CurrentPieceStatus RequestedPieceStatus
+	CurrentBlockOffset int
 	CurrentBlockStatus RequestedBlockStatus
 	BlockPipeline      *list.List
 }
@@ -449,43 +459,8 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 		routerListener(childCtx, p, peerConnSendCh)
 	}()
 
-	// PIECE REQUEST LOOP
-	p.wg.Add(1)
-	go func() {
-		defer p.wg.Done()
-		for {
-			select {
-			case <-childCtx.Done():
-				// stuff
-				return
-			case block := <-p.BlockPipeline:
-				if p.IsInteresting && !p.IsChoking {
-					peerConnSendCh <- generateRequestMsg(block.Index, block.Offset, block.Size)
-				}
-			}
-		}
-	}()
+	pieceRequester(childCtx, p, peerConnSendCh)
 
-	select {
-	case <-ctx.Done():
-		return
-	default:
-
-		msgId := uuid.NewString()
-		p.SentMessages[msgId] = true
-
-		p.Router.Send("", messaging.Message{
-			Id:          msgId,
-			SourceId:    p.id,
-			ReplyTo:     p.id,
-			ReplyingTo:  "",
-			PayloadType: messaging.NextBlockIndexRequest,
-			Payload: messaging.NextBlockIndexRequestPayload{
-				PieceIndex: 1,
-			},
-			CreatedAt: time.Now(),
-		})
-	}
 }
 
 func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
@@ -663,9 +638,7 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 
 			p.mu.RLock()
 
-			if msg.ReplyingTo == "" {
-				continue
-			} else {
+			if msg.ReplyingTo != "" {
 				exists := p.SentMessages[msg.ReplyingTo]
 				if !exists {
 					p.Router.Send("peer_orchestrator", messaging.Message{
@@ -737,7 +710,6 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 						},
 						CreatedAt: time.Now(),
 					})
-
 				}
 
 			case messaging.PieceValidated:
@@ -758,15 +730,25 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 					})
 				}
 
-				peerConnSendCh <- generateHaveMsg(payload.Index)
-
 				p.mu.RUnlock()
 				p.mu.Lock()
+
+				if payload.Index == uint32(p.CurrentPieceIndex) {
+					p.CurrentPieceStatus = PieceComplete
+				}
 				p.OurBitfield.Set(uint(payload.Index))
+
 				p.mu.Unlock()
 				p.mu.Lock()
 
+				peerConnSendCh <- generateHaveMsg(payload.Index)
+
 			case messaging.NextBlockIndexSend:
+
+				if p.BlockPipeline.Len() >= BLOCK_PIPELINE_SIZE || p.CurrentPieceStatus == PieceComplete {
+					// log
+					continue
+				}
 
 				payload, ok := msg.Payload.(messaging.NextBlockIndexSendPayload)
 				if !ok {
@@ -784,28 +766,17 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 					})
 				}
 
-				select {
-				case p.BlockPipeline <- messaging.BlockRequestPayload{
+				p.mu.RUnlock()
+				p.mu.Lock()
+				p.BlockPipeline.PushBack(messaging.BlockRequestPayload{
 					Index:  uint32(payload.PieceIndex),
 					Offset: uint32(payload.Offset),
 					Size:   uint32(payload.Size),
-				}:
-					continue
-				default:
-					p.Router.Send(msg.ReplyTo, messaging.Message{
-						SourceId:    p.id,
-						PayloadType: messaging.Error,
-						Payload: messaging.ErrorPayload{
-							Message:     "Block pipeline is full, dropping message",
-							Severity:    messaging.Warning,
-							Time:        time.Now(),
-							ComponentId: p.id,
-						},
-					})
-				}
+				})
+				p.mu.Unlock()
+				p.mu.RLock()
 
 			}
-
 			p.mu.RUnlock()
 		}
 	}
@@ -926,6 +897,22 @@ func peerListener(ctx context.Context, p *PeerManager, peerConnRecvCh <-chan Pee
 
 			case Piece:
 
+				pieceIndex := binary.BigEndian.Uint32(msg.data[5:9])
+				blockOffset := binary.BigEndian.Uint32(msg.data[9:13])
+				blockSize := uint32(len(msg.data[13:]))
+
+				if pieceIndex != uint32(p.CurrentPieceIndex) {
+					// log error
+					continue
+				}
+
+				if blockOffset != uint32(p.CurrentBlockOffset) {
+					// log error
+					continue
+				}
+
+				p.CurrentBlockStatus = Complete
+
 				msgId := uuid.NewString()
 				p.SentMessages[msgId] = true
 
@@ -935,15 +922,55 @@ func peerListener(ctx context.Context, p *PeerManager, peerConnRecvCh <-chan Pee
 					ReplyTo:     p.id,
 					PayloadType: messaging.BlockSend,
 					Payload: messaging.BlockSendPayload{
-						Index:  binary.BigEndian.Uint32(msg.data[5:9]),
-						Offset: binary.BigEndian.Uint32(msg.data[9:13]),
-						Size:   uint32(len(msg.data[13:])),
+						Index:  pieceIndex,
+						Offset: blockOffset,
+						Size:   blockSize,
 						Data:   msg.data[13:],
 					},
 					CreatedAt: time.Now(),
 				})
+
+				if p.BlockPipeline.Len() < BLOCK_PIPELINE_SIZE && p.CurrentPieceStatus == PiecePending {
+				}
 			}
 			p.mu.Unlock()
+		}
+	}
+}
+
+func pieceRequester(ctx context.Context, p *PeerManager, peerConnSendCh chan<- []byte) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			p.mu.RLock()
+			if p.CurrentBlockStatus == Complete && p.CurrentPieceStatus == PiecePending && p.IsInteresting && !p.IsChoking {
+
+				p.mu.RUnlock()
+				p.mu.Lock()
+
+				firstElem := p.BlockPipeline.Front()
+				if firstElem == nil {
+					// log
+					continue
+				}
+				p.BlockPipeline.Remove(firstElem)
+
+				block, ok := firstElem.Value.(messaging.NextBlockIndexSendPayload)
+				if !ok {
+					// log
+					continue
+				}
+
+				peerConnSendCh <- generateRequestMsg(uint32(block.PieceIndex), uint32(block.Offset), uint32(block.Size))
+				p.CurrentBlockStatus = Pending
+				p.CurrentBlockOffset = block.Offset
+
+				p.mu.Unlock()
+				p.mu.RLock()
+			}
+			p.mu.RUnlock()
 		}
 	}
 }
