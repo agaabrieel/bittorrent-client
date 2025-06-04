@@ -807,14 +807,12 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 						CreatedAt: time.Now(),
 					})
 				}
-
 				p.mu.RUnlock()
 				p.mu.Lock()
 				p.CurrentPieceIndex = payload.Index
 				p.CurrentPieceStatus = PiecePending
 				p.mu.Unlock()
 				p.mu.RLock()
-
 			}
 			p.mu.RUnlock()
 		}
