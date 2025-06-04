@@ -287,13 +287,23 @@ func updatePieceFrequency(frequencyMap map[int]float64, peersBitsets map[string]
 }
 
 func pickRarestPiece(frequencyMap map[int]float64, peerBitset *bitset.BitSet) int {
+
 	minFreq := 1.0
 	rarestPieceIdx := -1
-	for idx, freq := range frequencyMap {
-		if peerBitset.Test(uint(idx)) && freq < minFreq && freq > 0 {
+
+	var idx uint
+	var found bool
+	for idx, found = peerBitset.NextSet(0); idx < uint(peerBitset.Len()); idx, found = peerBitset.NextSet(idx + 1) {
+		if !found {
+			break
+		}
+
+		freq := frequencyMap[int(idx)]
+		if freq < minFreq {
 			minFreq = freq
-			rarestPieceIdx = idx
+			rarestPieceIdx = int(idx)
 		}
 	}
+
 	return rarestPieceIdx
 }
