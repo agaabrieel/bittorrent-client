@@ -34,8 +34,8 @@ func (r *Router) RegisterComponent(id string, ch chan Message) error {
 
 func (r *Router) Send(destId string, msg Message) {
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 
 	r.log(msg)
 
@@ -47,7 +47,13 @@ func (r *Router) Send(destId string, msg Message) {
 		select {
 		case ch <- msg:
 		default:
+
+			r.mu.RUnlock()
+			r.mu.Lock()
 			r.MessageBuffer[msg] = destId
+			r.mu.Unlock()
+			r.mu.RLock()
+
 			r.log(Message{
 				SourceId:    "router",
 				PayloadType: Error,

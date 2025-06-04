@@ -738,6 +738,15 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 				}
 				p.OurBitfield.Set(uint(payload.Index))
 
+				p.Router.Send("peer_orchestrator", messaging.Message{
+					Id:          uuid.NewString(),
+					SourceId:    p.id,
+					ReplyTo:     p.id,
+					PayloadType: messaging.NextPieceIndexRequest,
+					Payload:     messaging.NextBlockIndexRequestPayload{},
+					CreatedAt:   time.Now(),
+				})
+
 				p.mu.Unlock()
 				p.mu.Lock()
 
@@ -773,6 +782,36 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 					Offset: uint32(payload.Offset),
 					Size:   uint32(payload.Size),
 				})
+				p.mu.Unlock()
+				p.mu.RLock()
+
+			case messaging.NextPieceIndexSend:
+
+				if p.CurrentPieceStatus != PieceComplete {
+					// log
+					continue
+				}
+
+				payload, ok := msg.Payload.(messaging.NextPieceIndexSendPayload)
+				if !ok {
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("unexpected payload, expected NextPieceIndexSendPayload, got %v", msg.PayloadType),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+				}
+
+				p.mu.RUnlock()
+				p.mu.Lock()
+				p.CurrentPieceIndex = payload.Index
+				p.CurrentPieceStatus = PiecePending
 				p.mu.Unlock()
 				p.mu.RLock()
 

@@ -21,6 +21,7 @@ type PeerOrchestrator struct {
 	clientInfohash [20]byte
 	Bitfield       *bitset.BitSet
 	PeerBitfields  map[string]*bitset.BitSet
+	PieceFrequency map[int]float64
 	SentMessages   map[string]bool
 	Mutex          *sync.RWMutex
 	Waitgroup      *sync.WaitGroup
@@ -43,6 +44,7 @@ func NewPeerOrchestrator(meta *metainfo.TorrentMetainfo, r *messaging.Router, cl
 		clientInfohash: meta.Infohash,
 		Bitfield:       bitset.New(bsSize),
 		PeerBitfields:  make(map[string]*bitset.BitSet),
+		PieceFrequency: make(map[int]float64, bsSize),
 		RecvCh:         ch,
 		Mutex:          &sync.RWMutex{},
 	}, nil
@@ -185,6 +187,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 					mngr.Mutex.Lock()
 					mngr.PeerBitfields[msg.SourceId] = payload.Bitfield
+					mngr.PieceFrequency = updatePieceFrequency(mngr.PieceFrequency, mngr.PeerBitfields)
 					mngr.Mutex.Unlock()
 
 				case messaging.PeerBitfieldUpdate:
@@ -207,6 +210,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 					mngr.Mutex.Lock()
 					mngr.PeerBitfields[msg.SourceId].Set(uint(payload.Index))
+					mngr.PieceFrequency = updatePieceFrequency(mngr.PieceFrequency, mngr.PeerBitfields)
 					mngr.Mutex.Unlock()
 
 				case messaging.NextPieceIndexRequest:
@@ -227,10 +231,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 						})
 					}
 
-					// PICK NEXT PIECE BASED ON RARITY
-					// mockup
-					index := 10
-					// MOCKUP
+					pieceIdx := pickRarestPiece(mngr.PieceFrequency, mngr.PeerBitfields[msg.SourceId])
 
 					msgId := uuid.NewString()
 					mngr.SentMessages[msgId] = true
@@ -242,7 +243,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 						ReplyingTo:  msg.Id,
 						PayloadType: messaging.NextPieceIndexSend,
 						Payload: messaging.NextPieceIndexSendPayload{
-							Index: index,
+							Index: pieceIdx,
 						},
 						CreatedAt: time.Now(),
 					})
@@ -261,4 +262,38 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 			return // should add logging here
 		}
 	}
+}
+
+func updatePieceFrequency(frequencyMap map[int]float64, peersBitsets map[string]*bitset.BitSet) map[int]float64 {
+	numPieces := len(frequencyMap)
+	pieceCountMap := make(map[int]int, numPieces)
+
+	var idx uint
+	var found bool
+	for _, bs := range peersBitsets {
+		for idx, found = bs.NextSet(0); idx < uint(bs.Len()); idx, found = bs.NextSet(idx + 1) {
+			if !found {
+				break
+			}
+			pieceCountMap[int(idx)]++
+		}
+	}
+
+	for i := range numPieces {
+		frequencyMap[i] = float64(pieceCountMap[i]) / float64(numPieces)
+	}
+
+	return frequencyMap
+}
+
+func pickRarestPiece(frequencyMap map[int]float64, peerBitset *bitset.BitSet) int {
+	minFreq := 1.0
+	rarestPieceIdx := -1
+	for idx, freq := range frequencyMap {
+		if peerBitset.Test(uint(idx)) && freq < minFreq && freq > 0 {
+			minFreq = freq
+			rarestPieceIdx = idx
+		}
+	}
+	return rarestPieceIdx
 }
