@@ -22,6 +22,12 @@ const (
 	Complete
 )
 
+type Block struct {
+	Data   []byte
+	Piece  int
+	Offset int
+}
+
 type Piece struct {
 	BlockBitfield *bitset.BitSet
 	BlockStatuses []BlockStatus

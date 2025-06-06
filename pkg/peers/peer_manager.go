@@ -78,6 +78,7 @@ type PeerManager struct {
 	CurrentBlockOffset int
 	CurrentBlockStatus RequestedBlockStatus
 	BlockPipeline      *list.List
+	AskedBlocks        *list.List
 }
 
 func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.WaitGroup) *PeerManager {
@@ -94,6 +95,7 @@ func NewPeerManager(r *messaging.Router, conn net.Conn, addr net.Addr, wg *sync.
 		wg:            wg,
 		RecvCh:        ch,
 		BlockPipeline: list.New(),
+		AskedBlocks:   list.New(),
 	}
 }
 
@@ -445,14 +447,14 @@ func (p *PeerManager) mainLoop(ctx context.Context) {
 
 	peerConnSendCh <- bitfieldMsg
 
-	// PEER MESSAGE LISTENER WORKER
+	// PEER MESSAGE LISTENER
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
 		peerListener(childCtx, p, peerConnRecvCh, peerConnSendCh)
 	}()
 
-	// ROUTER LISTENING LOOP
+	// ROUTER LISTENER
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -576,7 +578,53 @@ func (p *PeerManager) writeLoop(ctx context.Context, recvCh <-chan []byte) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			return
+
+			msg := generateNoPayloadMsg(KeepAlive)
+			totalLen := len(msg)
+
+			bytesWritten := 0
+			for bytesWritten < totalLen {
+				p.PeerConn.SetWriteDeadline(time.Now().Add(time.Second * 15))
+
+				n, err := p.PeerConn.Write(msg[bytesWritten:])
+				bytesWritten += n
+				if err != nil {
+
+					if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+						p.Router.Send("peer_orchestrator", messaging.Message{
+							SourceId:    p.id,
+							PayloadType: messaging.Error,
+							Payload: messaging.ErrorPayload{
+								Message:     fmt.Sprintf("writer timed out: %s", err.Error()),
+								Severity:    messaging.Warning,
+								ErrorCode:   messaging.ErrCodeInvalidPayload,
+								Time:        time.Now(),
+								ComponentId: p.id,
+							},
+							CreatedAt: time.Now(),
+						})
+						return
+
+					} else if err == io.EOF {
+						return
+					}
+
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("write error: %s", err.Error()),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidConnection,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+					return
+				}
+			}
+
 		case msg := <-recvCh:
 
 			totalLen := len(msg)
@@ -693,6 +741,29 @@ func routerListener(ctx context.Context, p *PeerManager, peerConnSendCh chan<- [
 					})
 					continue
 				}
+
+				askedBlock := p.AskedBlocks.Front().Value.(messaging.BlockRequestPayload)
+				if askedBlock.Index != payload.Index || askedBlock.Offset != payload.Offset || askedBlock.Size != payload.Index {
+					p.Router.Send("peer_orchestrator", messaging.Message{
+						SourceId:    p.id,
+						PayloadType: messaging.Error,
+						Payload: messaging.ErrorPayload{
+							Message:     fmt.Sprintf("unexpected block, expected %v, got %v", askedBlock, payload),
+							Severity:    messaging.Warning,
+							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							Time:        time.Now(),
+							ComponentId: p.id,
+						},
+						CreatedAt: time.Now(),
+					})
+					continue
+				}
+
+				p.mu.RUnlock()
+				p.mu.Lock()
+				p.AskedBlocks.Remove(p.AskedBlocks.Front())
+				p.mu.Unlock()
+				p.mu.RLock()
 
 				if p.IsInterested && !p.IsChoking {
 					peerConnSendCh <- generatePieceMsg(payload.Index, payload.Offset, payload.Data)
@@ -915,8 +986,17 @@ func peerListener(ctx context.Context, p *PeerManager, peerConnRecvCh <-chan Pee
 
 			case Request:
 
+				blockIdx := binary.BigEndian.Uint32(msg.data[5:9])
+				blockOffset := binary.BigEndian.Uint32(msg.data[9:13])
+				blockSize := binary.BigEndian.Uint32(msg.data[13:17])
+
 				msgId := uuid.NewString()
 				p.SentMessages[msgId] = true
+				p.AskedBlocks.PushFront(messaging.BlockRequestPayload{
+					Index:  blockIdx,
+					Offset: blockOffset,
+					Size:   blockSize,
+				})
 
 				p.Router.Send("piece_manager", messaging.Message{
 					Id:          msgId,
@@ -925,9 +1005,9 @@ func peerListener(ctx context.Context, p *PeerManager, peerConnRecvCh <-chan Pee
 					ReplyingTo:  "",
 					PayloadType: messaging.BlockRequest,
 					Payload: messaging.BlockRequestPayload{
-						Index:  binary.BigEndian.Uint32(msg.data[5:9]),
-						Offset: binary.BigEndian.Uint32(msg.data[9:13]),
-						Size:   binary.BigEndian.Uint32(msg.data[13:17]),
+						Index:  blockIdx,
+						Offset: blockOffset,
+						Size:   blockSize,
 					},
 					CreatedAt: time.Now(),
 				})
