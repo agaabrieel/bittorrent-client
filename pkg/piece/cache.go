@@ -5,8 +5,11 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 
+	"github.com/agaabrieel/bittorrent-client/pkg/utils"
 	"github.com/bits-and-blooms/bitset"
 )
 
@@ -48,12 +51,117 @@ type PieceCacheEntry struct {
 }
 
 func NewPieceCache(capacity uint32) *PieceCache {
-	return &PieceCache{
+	pc := &PieceCache{
 		cap:         capacity,
 		cacheList:   list.New(),
 		cacheMap:    make(map[uint32]*list.Element),
 		filenameMap: make(map[uint32]string),
 	}
+
+	err := pc.Startup()
+	if err != nil {
+		return nil
+	}
+
+	return pc
+}
+
+func (pc *PieceCache) Startup() error {
+
+	err := os.Chdir("tmp/")
+	if err != nil {
+		return err
+	}
+
+	curr_dir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+
+	dir_entries, err := os.ReadDir(curr_dir)
+	if err != nil {
+		return err
+	}
+
+	blockBuffer := make([]byte, BLOCK_SIZE)
+	blockBitfieldBuffer := make([]byte, BLOCK_BITFIELD_SIZE)
+
+	for _, entry := range dir_entries {
+
+		if pc.cacheList.Len() > int(pc.cap) {
+			break
+		}
+
+		if entry.IsDir() {
+			continue
+		}
+
+		split_filename := strings.Split(entry.Name(), ".")
+		if split_filename[1] != "tmp" {
+			continue
+		}
+
+		piece_idx, err := strconv.ParseInt(strings.Split(split_filename[0], "-")[1], 10, 0)
+		if err != nil {
+			return err
+		}
+
+		f, err := os.Open(entry.Name())
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+
+		fStats, err := f.Stat()
+		if err != nil {
+			return err
+		}
+
+		var readBytes int64 = 0
+		for readBytes < BLOCK_SIZE {
+			n, err := f.ReadAt(blockBuffer[readBytes:], int64(readBytes))
+			if err != nil {
+				return err
+			}
+			readBytes += int64(n)
+		}
+
+		tmpFileSize := fStats.Size()
+		for readBytes < tmpFileSize {
+			n, err := f.ReadAt(blockBitfieldBuffer[readBytes:], int64(readBytes))
+			if err != nil {
+				return err
+			}
+			readBytes += int64(n)
+		}
+
+		blocks_status := make([]BlockStatus, BLOCK_BITFIELD_SIZE)
+		var byte_val byte
+		for idx := range BLOCK_BITFIELD_SIZE {
+			byte_val = (blockBitfieldBuffer[idx] & (0b1 << idx % 8)) >> idx % 8
+			if byte_val == 0b1 {
+				blocks_status[idx] = Complete
+			} else {
+				blocks_status[idx] = Missing
+			}
+		}
+
+		int64_bs := utils.ByteArrToUint64Arr(blockBitfieldBuffer)
+		bs := bitset.From(int64_bs)
+
+		newEntry := &PieceCacheEntry{
+			idx: uint32(piece_idx),
+			piece: &Piece{
+				BlockBitfield: bs,
+				BlockStatuses: blocks_status,
+				Blocks:        blockBuffer,
+			},
+		}
+
+		elem := pc.cacheList.PushFront(newEntry)
+		pc.cacheMap[uint32(piece_idx)] = elem
+	}
+	return nil
 }
 
 func (pc *PieceCache) GetPiece(idx uint32) (*Piece, error) {

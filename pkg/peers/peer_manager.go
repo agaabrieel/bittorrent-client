@@ -497,7 +497,7 @@ func (p *PeerManager) readLoop(ctx context.Context, sendCh chan<- PeerMessage) {
 						Payload: messaging.ErrorPayload{
 							Message:     fmt.Sprintf("reading timed-out, closing connection: %s", err.Error()),
 							Severity:    messaging.Warning,
-							ErrorCode:   messaging.ErrCodeInvalidPayload,
+							ErrorCode:   messaging.ErrCodeInvalidPayload, // CHANGE ERROR
 							Time:        time.Now(),
 							ComponentId: p.id,
 						},

@@ -85,8 +85,7 @@ func pieceManagerWorker(ctx context.Context, mngr *PieceManager, workersJobsCh c
 			mngr.mutex.RLock()
 			if msg.ReplyingTo != "" {
 
-				exists := mngr.SentMessages[msg.ReplyingTo]
-				if !exists {
+				if exists := mngr.SentMessages[msg.ReplyingTo]; !exists {
 					mngr.Router.Send("error_manager", messaging.Message{
 						Id:          uuid.NewString(),
 						SourceId:    mngr.id,
@@ -237,7 +236,7 @@ func (mngr *PieceManager) pickNextBlock(pieceIndex uint32) (int, int, error) {
 
 	piece, err := mngr.PieceCache.GetPiece(pieceIndex)
 	if err != nil {
-		// log, do something, return
+		// log, do something, return, idk
 		return -1, -1, err
 	}
 

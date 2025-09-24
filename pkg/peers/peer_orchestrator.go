@@ -62,6 +62,7 @@ func (mngr *PeerOrchestrator) Run(ctx context.Context, wg *sync.WaitGroup) {
 		go func() {
 			defer wg.Done()
 			for msg := range workersJobsCh {
+
 				if msg.ReplyingTo != "" {
 					mngr.Mutex.Lock()
 					exists := mngr.SentMessages[msg.ReplyingTo]
